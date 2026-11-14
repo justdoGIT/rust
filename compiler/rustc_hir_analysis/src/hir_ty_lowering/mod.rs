@@ -15,7 +15,7 @@
 //! [^1]: This includes types, lifetimes / regions, constants in type positions,
 //! trait references and bounds.
 
-mod bounds;
+pub(crate) mod bounds;
 mod cmse;
 mod dyn_trait;
 pub mod errors;
@@ -25,6 +25,7 @@ use std::{assert_matches, slice};
 
 use rustc_abi::FIRST_VARIANT;
 use rustc_ast::LitKind;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
 use rustc_data_structures::sso::SsoHashSet;
 use rustc_data_structures::thin_vec::ThinVec;
@@ -33,7 +34,6 @@ use rustc_errors::{
     Applicability, Diag, DiagCtxtHandle, ErrorGuaranteed, FatalError, StashKey,
     struct_span_code_err,
 };
-use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::{self as hir, AnonConst, GenericArg, GenericArgs, HirId};
@@ -43,14 +43,13 @@ use rustc_lint_defs::builtin::AMBIGUOUS_ASSOCIATED_ITEMS;
 use rustc_macros::{TypeFoldable, TypeVisitable};
 use rustc_middle::middle::stability::AllowUnstable;
 use rustc_middle::ty::{
-    self, Const, FnSigKind, GenericArgKind, GenericArgsRef, GenericParamDefKind, LitToConstInput,
-    RegionExt, Ty, TyCtxt, TypeSuperFoldable, TypeVisitableExt, TypingMode, Unnormalized, Upcast,
-    const_lit_matches_ty, fold_regions,
+    self, Const, FnSigKind, GenericArgKind, GenericParamDefKind, IncludeSizedImplicitBounds,
+    LitToConstInput, Ty, TyCtxt, TypeSuperFoldable, TypeVisitableExt, TypingMode, Unnormalized,
+    Upcast, const_lit_matches_ty, fold_regions,
 };
-use rustc_middle::{bug, span_bug};
 use rustc_session::diagnostics::feature_err;
-use rustc_span::def_id::ModId;
-use rustc_span::{DUMMY_SP, Ident, Span, kw, sym};
+use rustc_span::def_id::{LocalModId, ModId};
+use rustc_span::{DUMMY_SP, Ident, Span, bug, kw, span_bug, sym};
 use rustc_trait_selection::infer::InferCtxtExt;
 use rustc_trait_selection::traits::{self, FulfillmentError};
 use tracing::{debug, instrument};
@@ -143,6 +142,9 @@ pub trait HirTyLowerer<'tcx> {
     /// Returns the [`LocalDefId`] of the overarching item whose constituents get lowered.
     fn item_def_id(&self) -> LocalDefId;
 
+    /// Returns the containing module.
+    fn mod_id(&self) -> LocalModId;
+
     /// Returns the region to use when a lifetime is omitted (and not elided).
     fn re_infer(&self, span: Span, reason: RegionInferReason<'_>) -> ty::Region<'tcx>;
 
@@ -205,7 +207,7 @@ pub trait HirTyLowerer<'tcx> {
         item_def_id: DefId,
         item_segment: &hir::PathSegment<'_>,
         poly_trait_ref: ty::PolyTraitRef<'tcx>,
-    ) -> Result<(DefId, GenericArgsRef<'tcx>), ErrorGuaranteed>;
+    ) -> Result<(DefId, ty::GenericArgs<'tcx>), ErrorGuaranteed>;
 
     fn lower_fn_sig(
         &self,
@@ -282,7 +284,7 @@ impl LowerTypeRelativePathMode {
     fn def_kind_for_diagnostics(self) -> DefKind {
         match self {
             Self::Type(_) => DefKind::AssocTy,
-            Self::Const => DefKind::AssocConst { is_type_const: false },
+            Self::Const => DefKind::AssocConst,
         }
     }
 
@@ -307,7 +309,7 @@ pub enum PermitVariants {
 enum TypeRelativePath<'tcx> {
     AssocItem(ty::AliasTerm<'tcx>),
     Variant { adt: Ty<'tcx>, variant_did: DefId },
-    Ctor { ctor_def_id: DefId, args: GenericArgsRef<'tcx> },
+    Ctor { ctor_def_id: DefId, args: ty::GenericArgs<'tcx> },
 }
 
 /// New-typed boolean indicating whether explicit late-bound lifetimes
@@ -416,7 +418,7 @@ impl<'tcx> ForbidParamUsesFolder<'tcx> {
                 "generic `Self` types are currently not permitted in anonymous constants"
             }
             ForbidParamContext::ConstArgument => {
-                if self.tcx.features().generic_const_args() {
+                if self.tcx.features().gca_const_items() {
                     "generic parameters in const blocks are not allowed; use a named `const` item instead"
                 } else {
                     "generic parameters may not be used in const operations"
@@ -439,18 +441,18 @@ impl<'tcx> ForbidParamUsesFolder<'tcx> {
             }
         }
         if matches!(self.context, ForbidParamContext::ConstArgument) {
-            if self.tcx.features().generic_const_args() {
-                diag.help("consider factoring the expression into a `type const` item and use it as the const argument instead");
-            } else if self.tcx.features().min_generic_const_args() {
-                diag.help("add `#![feature(generic_const_args)]` and extract the expression into a `type const` item");
+            if self.tcx.features().gca_const_items() {
+                diag.help("consider wrapping the expression in the `gca!` macro");
+            } else if self.tcx.features().gca_min_const_items() {
+                diag.help("add `#![feature(gca_const_items)]` and wrap the expression in the `gca!` macro");
             } else if self.tcx.sess.is_nightly_build() {
                 diag.help(
                     "add `#![feature(generic_const_exprs)]` to allow generic const expressions",
                 );
-                diag.help("alternatively, you can use `#![feature(generic_const_args)]` and extract the expression into a `type const` item");
+                diag.help("alternatively, you can use `#![feature(gca_const_items)]` and wrap the expression in the `gca!` macro");
             }
         }
-        diag.emit()
+        diag.emit_err()
     }
 }
 
@@ -630,7 +632,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         span: Span,
         def_id: DefId,
         item_segment: &hir::PathSegment<'_>,
-    ) -> GenericArgsRef<'tcx> {
+    ) -> ty::GenericArgs<'tcx> {
         let (args, _) = self.lower_generic_args_of_path(span, def_id, &[], item_segment, None);
         if let Some(c) = item_segment.args().constraints.first() {
             prohibit_assoc_item_constraint(self, c, Some((def_id, item_segment, span)));
@@ -657,7 +659,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
     /// 2. The path in question is the path to the trait `std::ops::Index`,
     ///    which will have been resolved to a `def_id`
     /// 3. The `generic_args` contains info on the `<...>` contents. The `usize` type
-    ///    parameters are returned in the `GenericArgsRef`
+    ///    parameters are returned in the `GenericArgs`
     /// 4. Associated item constraints like `Output = u32` are contained in `generic_args.constraints`.
     ///
     /// Note that the type listing given here is *exactly* what the user provided.
@@ -670,7 +672,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
     ///
     /// We have the parent args are the args for the parent trait:
     /// `[Vec<u8>, u8]` and `generic_args` are the arguments for the associated
-    /// type itself: `['a]`. The returned `GenericArgsRef` concatenates these two
+    /// type itself: `['a]`. The returned `GenericArgs` concatenates these two
     /// lists: `[Vec<u8>, u8, 'a]`.
     #[instrument(level = "debug", skip(self, span), ret)]
     pub(crate) fn lower_generic_args_of_path(
@@ -680,7 +682,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         parent_args: &[ty::GenericArg<'tcx>],
         segment: &hir::PathSegment<'_>,
         self_ty: Option<Ty<'tcx>>,
-    ) -> (GenericArgsRef<'tcx>, GenericArgCountResult) {
+    ) -> (ty::GenericArgs<'tcx>, GenericArgCountResult) {
         // If the type is parameterized by this region, then replace this
         // region with the current anon region binding (in other words,
         // whatever & would get replaced with).
@@ -901,10 +903,15 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         span: Span,
         item_def_id: DefId,
         item_segment: &hir::PathSegment<'_>,
-        parent_args: GenericArgsRef<'tcx>,
-    ) -> GenericArgsRef<'tcx> {
-        let (args, _) =
-            self.lower_generic_args_of_path(span, item_def_id, parent_args, item_segment, None);
+        parent_args: ty::GenericArgs<'tcx>,
+    ) -> ty::GenericArgs<'tcx> {
+        let (args, _) = self.lower_generic_args_of_path(
+            span,
+            item_def_id,
+            parent_args.as_slice(),
+            item_segment,
+            None,
+        );
         if let Some(c) = item_segment.args().constraints.first() {
             prohibit_assoc_item_constraint(self, c, Some((item_def_id, item_segment, span)));
         }
@@ -1020,7 +1027,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
 
         let constraints = segment.args().constraints;
 
-        if transient && (!generic_args[1..].is_empty() || !constraints.is_empty()) {
+        if transient && (!generic_args.as_slice()[1..].is_empty() || !constraints.is_empty()) {
             // Since the bound won't be present in the middle::ty IR as established above, any
             // arguments or constraints won't be checked for well-formedness in later passes.
             //
@@ -1481,9 +1488,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         )? {
             TypeRelativePath::AssocItem(alias_term) => {
                 let alias_ct = alias_term.expect_ct();
-                if let Some(def_id) = alias_ct.kind.opt_def_id() {
-                    self.require_type_const_attribute(def_id, span)?;
-                }
+                self.check_const_item_in_type_system(alias_ct.kind, span)?;
                 let ct = Const::new_alias(tcx, ty::IsRigid::No, alias_ct);
                 let ct = self.check_param_uses_if_mcg(ct, span, false);
                 Ok(ct)
@@ -1544,7 +1549,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                             },
                         );
                         let ty::Adt(_, enum_args) = self_ty.kind() else { unreachable!() };
-                        return Ok(TypeRelativePath::Ctor { ctor_def_id, args: enum_args });
+                        return Ok(TypeRelativePath::Ctor { ctor_def_id, args: *enum_args });
                     }
                     if let PermitVariants::Yes = mode.permit_variants() {
                         tcx.check_stability(variant_def.def_id, Some(qpath_hir_id), span, None);
@@ -1609,7 +1614,16 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
             );
         }
 
-        Ok(TypeRelativePath::AssocItem(ty::AliasTerm::new_from_def_id(tcx, item_def_id, args)))
+        let kind = match mode {
+            LowerTypeRelativePathMode::Type(..) => {
+                ty::AliasTermKind::ProjectionTy { def_id: item_def_id }
+            }
+            LowerTypeRelativePathMode::Const => {
+                ty::AliasTermKind::ProjectionConst { def_id: item_def_id }
+            }
+        };
+
+        Ok(TypeRelativePath::AssocItem(ty::AliasTerm::new_from_args(tcx, kind, args)))
     }
 
     /// Resolve a [type-relative](hir::QPath::TypeRelative) (and type-level) path.
@@ -1709,7 +1723,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                         span,
                         "inherent associated types are unstable",
                     )
-                    .emit());
+                    .emit_err());
                 }
                 ty::AssocTag::Fn => unreachable!(),
             }
@@ -1773,12 +1787,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
 
         let kind = match assoc_tag {
             ty::AssocTag::Type => ty::AliasTermKind::InherentTy { def_id: assoc_item },
-            ty::AssocTag::Const => {
-                // FIXME(mgca): drop once `InherentConst` accepts IAC-shaped args (issue #156181)
-                // without this, `new_from_args` errors (#155341).
-                self.require_type_const_attribute(assoc_item, span)?;
-                ty::AliasTermKind::InherentConst { def_id: assoc_item }
-            }
+            ty::AssocTag::Const => ty::AliasTermKind::InherentConstSelf { def_id: assoc_item },
             ty::AssocTag::Fn => unreachable!(),
         };
 
@@ -1813,7 +1822,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
     ) -> Option<(ty::AssocItem, /*scope*/ ModId)> {
         let tcx = self.tcx();
 
-        let (ident, def_scope) = tcx.adjust_ident_and_get_scope(ident, scope, self.item_def_id());
+        let (ident, def_scope) = tcx.adjust_ident_and_get_scope(ident, scope, self.mod_id());
         // We have already adjusted the item name above, so compare with `.normalize_to_macros_2_0()`
         // instead of calling `filter_by_name_and_kind` which would needlessly normalize the
         // `ident` again and again.
@@ -1878,7 +1887,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                         })
                     // Consider only accessible traits
                     && tcx.visibility(*trait_def_id)
-                        .is_accessible_from(self.item_def_id(), tcx)
+                        .is_accessible_from(self.mod_id(), tcx)
                     && tcx.all_impls(*trait_def_id)
                         .any(|impl_def_id| {
                             let header = tcx.impl_trait_header(impl_def_id);
@@ -1945,13 +1954,10 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
             item_segment,
             ty::AssocTag::Const,
         )?;
-        self.require_type_const_attribute(item_def_id, span)?;
-        let alias_const = ty::AliasConst::new(
-            tcx,
-            ty::AliasConstKind::new_from_def_id(tcx, item_def_id),
-            item_args,
-        );
-        Ok(Const::new_alias(tcx, ty::IsRigid::No, alias_const))
+        let kind = ty::AliasConstKind::Projection { def_id: item_def_id };
+        self.check_const_item_in_type_system(kind, span)?;
+        let alias = ty::AliasConst::new(tcx, kind, item_args);
+        Ok(Const::new_alias(tcx, ty::IsRigid::No, alias))
     }
 
     /// Lower a [resolved][hir::QPath::Resolved] (type-level) associated item path.
@@ -1964,7 +1970,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         trait_segment: Option<&hir::PathSegment<'_>>,
         item_segment: &hir::PathSegment<'_>,
         assoc_tag: ty::AssocTag,
-    ) -> Result<(DefId, GenericArgsRef<'tcx>), ErrorGuaranteed> {
+    ) -> Result<(DefId, ty::GenericArgs<'tcx>), ErrorGuaranteed> {
         let tcx = self.tcx();
 
         let trait_def_id = tcx.parent(item_def_id);
@@ -2161,12 +2167,12 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
             }
 
             // Case 3. Reference to a top-level value.
-            DefKind::Fn | DefKind::Const { .. } | DefKind::ConstParam | DefKind::Static { .. } => {
+            DefKind::Fn | DefKind::Const | DefKind::ConstParam | DefKind::Static { .. } => {
                 generic_segments.push(GenericPathSegment(def_id, last));
             }
 
             // Case 4. Reference to a method or associated const.
-            DefKind::AssocFn | DefKind::AssocConst { .. } => {
+            DefKind::AssocFn | DefKind::AssocConst => {
                 if segments.len() >= 2 {
                     let generics = tcx.generics_of(def_id);
                     generic_segments.push(GenericPathSegment(generics.parent.unwrap(), last - 1));
@@ -2383,6 +2389,43 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         self.check_param_uses_if_mcg(ct, tcx.hir_span(path_hir_id), false)
     }
 
+    /// Lowers a call-argument expression into a ty::Const for an arg position
+    /// const param.
+    pub fn lower_const_arg_expr(&self, expr: &hir::Expr<'_>, ty: Ty<'tcx>) -> Const<'tcx> {
+        let tcx = self.tcx();
+        match expr.kind {
+            hir::ExprKind::Lit(lit) => {
+                self.lower_const_arg_literal(&lit.node, false, ty, expr.span)
+            }
+            hir::ExprKind::Unary(
+                hir::UnOp::Neg,
+                hir::Expr { kind: hir::ExprKind::Lit(lit), .. },
+            ) => self.lower_const_arg_literal(&lit.node, true, ty, expr.span),
+            hir::ExprKind::Path(hir::QPath::Resolved(_, hir::Path { res: Res::Local(_), .. })) => {
+                Const::new_error(tcx, self.dcx().span_err(expr.span, "Path error"))
+            }
+            hir::ExprKind::Path(hir::QPath::Resolved(maybe_qself, path)) => {
+                let opt_self_ty = maybe_qself.as_ref().map(|qself| self.lower_ty(qself));
+                self.lower_resolved_const_path(opt_self_ty, path, expr.hir_id)
+            }
+            hir::ExprKind::Path(hir::QPath::TypeRelative(hir_self_ty, segment)) => {
+                let self_ty = self.lower_ty(hir_self_ty);
+                self.lower_type_relative_const_path(
+                    self_ty,
+                    hir_self_ty,
+                    segment,
+                    expr.hir_id,
+                    expr.span,
+                )
+                .unwrap_or_else(|guard| Const::new_error(tcx, guard))
+            }
+            _ => Const::new_error(
+                tcx,
+                self.dcx().span_err(expr.span, "Some other variant we dont support"),
+            ),
+        }
+    }
+
     /// Lower a [`hir::ConstArg`] to a (type-level) [`ty::Const`].
     #[instrument(skip(self), level = "debug")]
     pub fn lower_const_arg(&self, const_arg: &hir::ConstArg<'_>, ty: Ty<'tcx>) -> Const<'tcx> {
@@ -2484,8 +2527,8 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
     ) -> Const<'tcx> {
         let tcx = self.tcx();
 
-        let (elem_ty, len) = match ty.kind() {
-            ty::Array(elem_ty, len) => (elem_ty, len),
+        let elem_ty = match ty.kind() {
+            ty::Array(elem_ty, _) => elem_ty,
             ty::Error(e) => return Const::new_error(tcx, *e),
             _ => {
                 let e = tcx
@@ -2501,28 +2544,13 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
             .map(|elem| self.lower_const_arg(elem, *elem_ty))
             .collect::<Vec<_>>();
 
-        let len = tcx
-            .try_normalize_erasing_regions(
-                ty::TypingEnv::new(ty::ParamEnv::empty(), TypingMode::non_body_analysis()),
-                Unnormalized::new_wip(*len),
-            )
-            .unwrap_or(*len);
-        if let Some(expected_len) = len.try_to_target_usize(tcx)
-            && expected_len != elems.len() as u64
-        {
-            let e = tcx.dcx().span_err(
-                array_expr.span,
-                format!(
-                    "expected array with {expected_len} elements, found {} elements",
-                    array_expr.elems.len()
-                ),
-            );
-            return Const::new_error(tcx, e);
-        }
-
+        // The array len passed in the type might be an infer var, or a const param, or it could
+        // just be an incorrect constant. So, construct the resulting valtree's type based on the
+        // provided syntax rather than the expected type. The surrounding typeck will catch any
+        // mismatches.
+        let valtree_ty = Ty::new_array(tcx, *elem_ty, elems.len() as u64);
         let valtree = ty::ValTree::from_branches(tcx, elems);
-
-        ty::Const::new_value(tcx, valtree, ty)
+        ty::Const::new_value(tcx, valtree, valtree_ty)
     }
 
     fn try_recover_misrepresented_function_call(
@@ -2554,7 +2582,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         &self,
         hir_id: HirId,
         qpath: hir::QPath<'_>,
-        args: &[&hir::ConstArg<'_>],
+        args: &[hir::ConstArg<'_>],
         span: Span,
     ) -> Const<'tcx> {
         let tcx = self.tcx();
@@ -2655,7 +2683,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
 
     fn lower_const_arg_tup(
         &self,
-        exprs: &[&hir::ConstArg<'_>],
+        exprs: &[hir::ConstArg<'_>],
         ty: Ty<'tcx>,
         span: Span,
     ) -> Const<'tcx> {
@@ -2698,7 +2726,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         &self,
         hir_id: HirId,
         qpath: hir::QPath<'_>,
-        inits: &[&hir::ConstArgExprField<'_>],
+        inits: &[hir::ConstArgExprField<'_>],
         span: Span,
     ) -> Const<'tcx> {
         // FIXME(mgca): try to deduplicate this function with
@@ -2781,7 +2809,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                         format!("`{}` does not have this field", variant_def.name),
                     );
                 }
-                return ty::Const::new_error(tcx, err.emit());
+                return ty::Const::new_error(tcx, err.emit_err());
             }
         }
 
@@ -2890,8 +2918,9 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 );
                 self.lower_const_param(def_id, hir_id)
             }
-            Res::Def(DefKind::Const { .. }, did) => {
-                if let Err(guar) = self.require_type_const_attribute(did, span) {
+            Res::Def(DefKind::Const, did) => {
+                let kind = ty::AliasConstKind::Free { def_id: did };
+                if let Err(guar) = self.check_const_item_in_type_system(kind, span) {
                     return Const::new_error(self.tcx(), guar);
                 }
 
@@ -2900,11 +2929,8 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 let _ = self
                     .prohibit_generic_args(leading_segments.iter(), GenericsArgsErrExtend::None);
                 let args = self.lower_generic_args_of_path_segment(span, did, segment);
-                ty::Const::new_alias(
-                    tcx,
-                    ty::IsRigid::No,
-                    ty::AliasConst::new(tcx, ty::AliasConstKind::new_from_def_id(tcx, did), args),
-                )
+                let alias = ty::AliasConst::new(tcx, kind, args);
+                ty::Const::new_alias(tcx, ty::IsRigid::No, alias)
             }
             Res::Def(kind @ DefKind::Ctor(ctor_of, CtorKind::Const), did) => {
                 assert_eq!(opt_self_ty, None);
@@ -2963,7 +2989,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
 
                 ty::Const::zero_sized(tcx, tcx.type_of(did).instantiate(tcx, args).skip_norm_wip())
             }
-            Res::Def(DefKind::AssocConst { .. }, did) => {
+            Res::Def(DefKind::AssocConst, did) => {
                 let trait_segment = if let [modules @ .., trait_, _item] = path.segments {
                     let _ = self.prohibit_generic_args(modules.iter(), GenericsArgsErrExtend::None);
                     Some(trait_)
@@ -2993,7 +3019,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 let guar = self
                     .dcx()
                     .struct_span_err(span, "function items cannot be used as const args")
-                    .emit();
+                    .emit_err();
                 Const::new_error(tcx, guar)
             }
             // Exhaustive match to be clear about what exactly we're considering to be
@@ -3135,51 +3161,54 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         })
     }
 
-    fn require_type_const_attribute(
+    /// `alias_const` is a const item used in the type system. Checks if that's OK.
+    fn check_const_item_in_type_system(
         &self,
-        def_id: DefId,
+        alias_const: ty::AliasConstKind<'tcx>,
         span: Span,
     ) -> Result<(), ErrorGuaranteed> {
         let tcx = self.tcx();
-        // FIXME(gca): Intentionally disallowing paths to inherent associated non-type constants
-        // until a refactoring for how generic args for IACs are represented has been landed.
-        let is_inherent_assoc_const = tcx.def_kind(def_id)
-            == DefKind::AssocConst { is_type_const: false }
-            && tcx.def_kind(tcx.parent(def_id)) == DefKind::Impl { of_trait: false };
-        if tcx.is_type_const(def_id)
-            || tcx.features().generic_const_args() && !is_inherent_assoc_const
-        {
+        if tcx.features().gca_const_items() || alias_const.is_direct_const(tcx) {
             Ok(())
         } else {
-            let mut err = self.dcx().struct_span_err(
-                span,
-                "use of `const` in the type system not defined as `type const`",
-            );
-            if let Some(local_def_id) = def_id.as_local() {
-                let name = tcx.def_path_str(def_id);
-                let (insertion_span, sugg) = match tcx.hir_node_by_def_id(local_def_id) {
-                    hir::Node::Item(item) if !item.vis_span.is_empty() => {
-                        (item.vis_span.shrink_to_hi(), " type")
-                    }
-                    hir::Node::ImplItem(impl_item)
-                        if let Some(vis_span) =
-                            impl_item.vis_span().filter(|span| !span.is_empty()) =>
-                    {
-                        (vis_span.shrink_to_hi(), " type")
-                    }
-                    _ => (tcx.def_span(def_id).shrink_to_lo(), "type "),
-                };
+            let mut err = self
+                .dcx()
+                .struct_span_err(span, "use of `const` in the type system not marked as direct");
+            let hir_node = match alias_const {
+                ty::AliasConstKind::Projection { def_id }
+                | ty::AliasConstKind::InherentSelf { def_id }
+                | ty::AliasConstKind::InherentImpl { def_id }
+                | ty::AliasConstKind::Free { def_id }
+                | ty::AliasConstKind::Anon { def_id } => {
+                    def_id.as_local().map(|id| tcx.hir_node_by_def_id(id))
+                }
+            };
+            if let Some(hir_node) = hir_node {
+                if let Some(body_id) = hir_node.body_id() {
+                    let body_span = tcx.hir_body(body_id).value.span;
 
-                err.span_suggestion_verbose(
-                    insertion_span,
-                    format!("add `type` before `const` for `{name}`"),
-                    sugg,
-                    Applicability::MaybeIncorrect,
-                );
+                    err.multipart_suggestion(
+                        "add gca!() to the right-hand side of the constant",
+                        vec![
+                            (body_span.shrink_to_lo(), String::from("core::gca!(")),
+                            (body_span.shrink_to_hi(), String::from(")")),
+                        ],
+                        Applicability::MaybeIncorrect,
+                    );
+                } else if let ty::AliasConstKind::Projection { .. } = alias_const {
+                    let node = hir_node.expect_trait_item();
+                    let sp = node.span.shrink_to_lo();
+                    err.span_suggestion_verbose(
+                        sp,
+                        "add `#[rustc_always_gca]` to the constant",
+                        "#[rustc_always_gca] ",
+                        Applicability::MaybeIncorrect,
+                    );
+                }
             } else {
-                err.note("only consts marked defined as `type const` may be used in types");
+                err.note("only consts with a `gca!` right-hand side may be used in types");
             }
-            Err(err.emit())
+            Err(err.emit_err())
         }
     }
 
@@ -3207,12 +3236,12 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         let result_ty = match &hir_ty.kind {
             hir::TyKind::InferDelegation(infer) => self.lower_delegation_ty(*infer),
             hir::TyKind::Slice(ty) => Ty::new_slice(tcx, self.lower_ty(ty)),
-            hir::TyKind::Ptr(mt) => Ty::new_ptr(tcx, self.lower_ty(mt.ty), mt.mutbl),
-            hir::TyKind::Ref(region, mt) => {
+            hir::TyKind::Ptr(ty, mutbl) => Ty::new_ptr(tcx, self.lower_ty(ty), *mutbl),
+            hir::TyKind::Ref(region, ty, mutbl) => {
                 let r = self.lower_lifetime(region, RegionInferReason::Reference);
                 debug!(?r);
-                let t = self.lower_ty(mt.ty);
-                Ty::new_ref(tcx, r, t, mt.mutbl)
+                let t = self.lower_ty(ty);
+                Ty::new_ref(tcx, r, t, *mutbl)
             }
             hir::TyKind::Never => tcx.types.never,
             hir::TyKind::Tup(fields) => {
@@ -3297,12 +3326,13 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                     PredicateFilter::All,
                     OverlappingAsssocItemConstraints::Allowed,
                 );
-                self.add_implicit_sizedness_bounds(
+                self.add_implicit_bounds(
                     &mut bounds,
                     self_ty,
                     hir_bounds,
                     ImpliedBoundsContext::AssociatedTypeOrImplTrait,
                     hir_ty.span,
+                    IncludeSizedImplicitBounds::Yes,
                 );
                 self.register_trait_ascription_bounds(bounds, hir_ty.hir_id, hir_ty.span);
                 self_ty
@@ -3438,7 +3468,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
             }
             hir::TyKind::FieldOf(ty, hir::TyFieldPath { variant, field }) => self.lower_field_of(
                 self.lower_ty(ty),
-                self.item_def_id(),
+                self.mod_id(),
                 ty.span,
                 hir_ty.hir_id,
                 *variant,
@@ -3492,7 +3522,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
     fn lower_field_of(
         &self,
         ty: Ty<'tcx>,
-        item_def_id: LocalDefId,
+        mod_id: LocalModId,
         ty_span: Span,
         hir_id: HirId,
         variant: Option<Ident>,
@@ -3512,7 +3542,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                                 field.span.shrink_to_lo(),
                                 "you might be missing a variant here: `Variant.`",
                             )
-                            .emit();
+                            .emit_err();
                         return Ty::new_error(tcx, err);
                     };
 
@@ -3523,9 +3553,8 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                     {
                         res
                     } else {
-                        let err = dcx
-                            .create_err(NoVariantNamed { span: variant.span, ident: variant, ty })
-                            .emit();
+                        let err =
+                            dcx.emit_err(NoVariantNamed { span: variant.span, ident: variant, ty });
                         return Ty::new_error(tcx, err);
                     }
                 } else {
@@ -3542,8 +3571,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                     }
                     (FIRST_VARIANT, def.non_enum_variant())
                 };
-                let (ident, def_scope) =
-                    tcx.adjust_ident_and_get_scope(field, def.did(), item_def_id);
+                let (ident, def_scope) = tcx.adjust_ident_and_get_scope(field, def.did(), mod_id);
                 if let Some((field_idx, field)) = variant
                     .fields
                     .iter_enumerated()
@@ -3564,8 +3592,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                     }
                     Ty::new_field_representing_type(tcx, ty, variant_idx, field_idx)
                 } else {
-                    let err =
-                        dcx.create_err(NoFieldOnType { span: ident.span, field: ident, ty }).emit();
+                    let err = dcx.emit_err(NoFieldOnType { span: ident.span, field: ident, ty });
                     Ty::new_error(tcx, err)
                 }
             }
@@ -3573,8 +3600,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 let index = match field.as_str().parse::<usize>() {
                     Ok(idx) => idx,
                     Err(_) => {
-                        let err =
-                            dcx.create_err(NoFieldOnType { span: field.span, field, ty }).emit();
+                        let err = dcx.emit_err(NoFieldOnType { span: field.span, field, ty });
                         return Ty::new_error(tcx, err);
                     }
                 };
@@ -3584,7 +3610,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 if tys.get(index).is_some() {
                     Ty::new_field_representing_type(tcx, ty, FIRST_VARIANT, index.into())
                 } else {
-                    let err = dcx.create_err(NoFieldOnType { span: field.span, field, ty }).emit();
+                    let err = dcx.emit_err(NoFieldOnType { span: field.span, field, ty });
                     Ty::new_error(tcx, err)
                 }
             }
@@ -3639,6 +3665,9 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 tcx,
                 dcx.span_err(ty_span, format!("type `{ty}` is not yet supported in `field_of!`")),
             ),
+
+            // FIXME(scrabsha)
+            ty::View(..) => unimplemented!(),
         }
     }
 
@@ -3837,7 +3866,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         &self,
         ctor_def_id: DefId,
         ctor_of: CtorOf,
-        args: GenericArgsRef<'tcx>,
+        args: ty::GenericArgs<'tcx>,
     ) -> Const<'tcx> {
         let tcx = self.tcx();
         let parent_did = tcx.parent(ctor_def_id);
@@ -3882,33 +3911,30 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         }
 
         // Step 2: check that the viewed type is a struct.
-        let variant = match inner_ty.kind() {
-            ty::Adt(def, _) if def.is_struct() => def.non_enum_variant(),
-
-            ty::Adt(def, _) => {
-                let guar = self.dcx().emit_err(diagnostics::OnlyStructsCanBeViewedAdt {
-                    ty: inner_ty,
-                    span: ty_span,
-                    article: def.article(),
-                    kind: def.descr(),
-                });
-                return Ty::new_error(self.tcx(), guar);
-            }
-
-            _ => {
-                let guar = self.dcx().emit_err(diagnostics::OnlyStructsCanBeViewedNonAdt {
-                    ty: inner_ty,
-                    span: ty_span,
-                });
-                return Ty::new_error(self.tcx(), guar);
-            }
+        let (ty::Adt(def, args) | ty::View(def, args, _)) = inner_ty.kind() else {
+            let guar = self.dcx().emit_err(diagnostics::OnlyStructsCanBeViewedNonAdt {
+                ty: inner_ty,
+                span: ty_span,
+            });
+            return Ty::new_error(self.tcx(), guar);
         };
+
+        if !def.is_struct() {
+            let guar = self.dcx().emit_err(diagnostics::OnlyStructsCanBeViewedAdt {
+                ty: inner_ty,
+                span: ty_span,
+                article: def.article(),
+                kind: def.descr(),
+            });
+            return Ty::new_error(self.tcx(), guar);
+        }
 
         // Step 3: check that every viewed field exists.
         let mut viewed_indices = Vec::with_capacity(viewed_fields.len());
         let mut error = None;
         for field in viewed_fields {
-            let Some((_, field)) = variant
+            let Some((field_idx, _)) = def
+                .non_enum_variant()
                 .fields
                 .iter_enumerated()
                 .find(|(_, f)| f.ident(self.tcx()).normalize_to_macros_2_0() == field)
@@ -3919,13 +3945,12 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 continue;
             };
 
-            viewed_indices.push(field);
+            viewed_indices.push(field_idx);
         }
         if let Some(guar) = error {
             return Ty::new_error(self.tcx(), guar);
         }
 
-        // FIXME(scrabsha): actually lower view types.
-        inner_ty
+        Ty::new_view(self.tcx(), *def, *args, &viewed_indices)
     }
 }

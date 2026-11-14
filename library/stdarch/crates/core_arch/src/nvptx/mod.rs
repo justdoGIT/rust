@@ -19,7 +19,7 @@ mod packed;
 pub use packed::*;
 
 #[allow(improper_ctypes)]
-unsafe extern "unadjusted" {
+unsafe extern "llvm-intrinsic" {
     #[link_name = "llvm.nvvm.barrier.cta.sync.aligned.all"]
     fn syncthreads(a: u32) -> ();
     #[link_name = "llvm.nvvm.read.ptx.sreg.ntid.x"]
@@ -145,7 +145,7 @@ pub unsafe fn _thread_idx_z() -> u32 {
 #[inline]
 #[unstable(feature = "stdarch_nvptx", issue = "111199")]
 pub unsafe fn trap() -> ! {
-    crate::intrinsics::abort()
+    crate::intrinsics::abort_immediate()
 }
 
 // Basic CUDA syscall declarations.

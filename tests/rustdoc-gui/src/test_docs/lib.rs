@@ -14,6 +14,7 @@
 #![feature(macro_derive)]
 #![feature(negative_impls)]
 #![feature(doc_notable_trait)]
+#![feature(decl_macro)]
 
 /*!
 Enable the feature <span class="stab portability"><code>some-feature</code></span> to enjoy
@@ -769,12 +770,6 @@ pub mod impls_indent {
     pub struct Context;
 
     /// Working with objects.
-    ///
-    /// # Safety
-    ///
-    /// Functions that take indices of locals do not check bounds on these indices;
-    /// the caller must ensure that the indices are less than the number of locals
-    /// in the current stack frame.
     impl Context {
     }
 
@@ -815,6 +810,10 @@ pub mod tyalias {
     pub type Y = X<u8>;
 }
 
+/// [check here](#short-anchor)
+///
+/// <a id="short-anchor"></a>
+/// # Some header with a long text that I don't want type in full every time I want to refer to it
 pub mod notable {
     #[doc(notable_trait)]
     pub trait Labeled {}
@@ -822,3 +821,10 @@ pub mod notable {
     pub struct Wrapper;
     impl Labeled for Wrapper {}
 }
+
+pub macro decl_macro {
+    () => { "bar" }
+}
+
+/// Some text before the code so the width isn't too small `Color::srgba_u8`, `blob`.
+pub mod inline_code {}

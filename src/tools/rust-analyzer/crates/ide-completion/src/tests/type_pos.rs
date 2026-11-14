@@ -1,7 +1,27 @@
 //! Completion tests for type position.
-use expect_test::expect;
+use expect_test::{Expect, expect};
 
-use crate::tests::{check, check_edit, check_with_base_items};
+use crate::{
+    CompletionConfig,
+    tests::{
+        BASE_ITEMS_FIXTURE, TEST_CONFIG, check, check_edit, check_with_base_items,
+        completion_list_with_config,
+    },
+};
+
+fn check_with_config(
+    config: crate::CompletionConfig<'_>,
+    #[rust_analyzer::rust_fixture] ra_fixture: &str,
+    expect: Expect,
+) {
+    let actual = completion_list_with_config(
+        config,
+        &super::concat_fixture(BASE_ITEMS_FIXTURE, ra_fixture),
+        false,
+        None,
+    );
+    expect.assert_eq(&actual)
+}
 
 #[test]
 fn record_field_ty() {
@@ -20,7 +40,7 @@ struct Foo<'lt, T, const C: usize> {
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt Trait
+            tt dyn Trait
             tp T
             un Union                  Union
             bt u32                      u32
@@ -49,7 +69,7 @@ struct Foo<'lt, T, const C: usize>(f$0);
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt Trait
+            tt dyn Trait
             tp T
             un Union                  Union
             bt u32                      u32
@@ -79,7 +99,6 @@ fn x<'lt, T, const C: usize>() -> $0
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt Trait
             tp T
             un Union                  Union
             bt u32                      u32
@@ -106,7 +125,6 @@ fn x() u$0
             st Record (adds ->)      Record
             st Tuple (adds ->)        Tuple
             st Unit (adds ->)          Unit
-            tt Trait (adds ->)
             un Union (adds ->)        Union
             bt u32 (adds ->)            u32
             kw crate:: (adds ->)
@@ -130,7 +148,6 @@ fn x() $0
             st Record (adds ->)      Record
             st Tuple (adds ->)        Tuple
             st Unit (adds ->)          Unit
-            tt Trait (adds ->)
             un Union (adds ->)        Union
             bt u32 (adds ->)            u32
             kw crate:: (adds ->)
@@ -244,6 +261,40 @@ fn foo() -> foo::Num
 "#,
     );
 
+    check_edit(
+        "u32",
+        r#"
+macro_rules! identity { ($($t:tt)*) => {$($t)*}; }
+identity! {
+    fn foo() u$0
+}
+"#,
+        r#"
+macro_rules! identity { ($($t:tt)*) => {$($t)*}; }
+identity! {
+    fn foo() -> u32
+}
+"#,
+    );
+
+    check_edit(
+        "Num",
+        r#"
+macro_rules! identity { ($($t:tt)*) => {$($t)*}; }
+mod foo { pub type Num = u32; }
+identity! {
+    fn foo() foo::N$0
+}
+"#,
+        r#"
+macro_rules! identity { ($($t:tt)*) => {$($t)*}; }
+mod foo { pub type Num = u32; }
+identity! {
+    fn foo() -> foo::Num
+}
+"#,
+    );
+
     // no spaces, test edit order
     check_edit(
         "foo",
@@ -310,7 +361,6 @@ fn x() u$0 {&2u32}
             st Record (adds ->)      Record
             st Tuple (adds ->)        Tuple
             st Unit (adds ->)          Unit
-            tt Trait (adds ->)
             un Union (adds ->)        Union
             bt u32 (adds ->)            u32
             it &u32 (adds ->)
@@ -350,7 +400,7 @@ fn x<'lt, T, const C: usize>(_: &()) -> &$0
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt Trait
+            tt dyn Trait
             tp T
             un Union                  Union
             bt u32                      u32
@@ -384,7 +434,6 @@ fn foo() -> B$0 {
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt Trait
             un Union                  Union
             bt u32                      u32
             it ()
@@ -413,7 +462,6 @@ const FOO: $0 = Foo(2);
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt Trait
             un Union                  Union
             bt u32                      u32
             it Foo<i32>
@@ -442,7 +490,6 @@ static FOO: $0 = Foo(2);
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt Trait
             un Union                  Union
             bt u32                      u32
             it Foo<i32>
@@ -472,7 +519,6 @@ fn f2() {
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt Trait
             un Union                  Union
             bt u32                      u32
             it i32
@@ -504,7 +550,6 @@ fn f2() {
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt Trait
             un Union                  Union
             bt u32                      u32
             it u64
@@ -533,7 +578,6 @@ fn f2(x: u64) -> $0 {
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt Trait
             un Union                  Union
             bt u32                      u32
             it u64
@@ -563,7 +607,6 @@ fn f2(x: $0) {
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt Trait
             un Union                  Union
             bt u32                      u32
             it i32
@@ -600,7 +643,6 @@ fn foo<'lt, T, const C: usize>() {
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt Trait
             tp T
             un Union                  Union
             bt u32                      u32
@@ -633,7 +675,6 @@ fn foo<'lt, T, const C: usize>() {
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt Trait
             tp T
             un Union                  Union
             bt u32                      u32
@@ -664,7 +705,6 @@ fn foo<'lt, T, const C: usize>() {
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt Trait
             tp T
             un Union                  Union
             bt u32                      u32
@@ -690,7 +730,6 @@ fn foo<'lt, T, const C: usize>() {
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt Trait
             un Union                  Union
         "#]],
     );
@@ -733,9 +772,9 @@ fn foo<'lt, T: Trait2<$0>, const CONST_PARAM: usize>(_: T) {}
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt Trait
-            tt Trait1
-            tt Trait2
+            tt dyn Trait
+            tt dyn Trait1
+            tt dyn Trait2
             tp T
             un Union                  Union
             bt u32                      u32
@@ -762,8 +801,8 @@ fn foo<'lt, T: Trait2<self::$0>, const CONST_PARAM: usize>(_: T) {}
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt Trait
-            tt Trait2
+            tt dyn Trait
+            tt dyn Trait2
             un Union                  Union
         "#]],
     );
@@ -789,8 +828,8 @@ impl Tr<$0
             st S                              S
             st Tuple                      Tuple
             st Unit                        Unit
-            tt Tr
-            tt Trait
+            tt dyn Tr
+            tt dyn Trait
             un Union                      Union
             bt u32                          u32
             kw crate::
@@ -838,8 +877,8 @@ fn f(t: impl MyTrait<u$0
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt MyTrait
-            tt Trait
+            tt dyn MyTrait
+            tt dyn Trait
             un Union                  Union
             bt u32                      u32
             kw crate::
@@ -867,8 +906,8 @@ fn f(t: impl MyTrait<u8, u$0
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt MyTrait
-            tt Trait
+            tt dyn MyTrait
+            tt dyn Trait
             un Union                  Union
             bt u32                      u32
             kw crate::
@@ -914,8 +953,8 @@ fn f(t: impl MyTrait<u$0
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt MyTrait
-            tt Trait
+            tt dyn MyTrait
+            tt dyn Trait
             un Union                  Union
             bt u32                      u32
             kw crate::
@@ -943,8 +982,8 @@ fn f(t: impl MyTrait<u8, u$0
             st Record                    Record
             st Tuple                      Tuple
             st Unit                        Unit
-            tt MyTrait
-            tt Trait
+            tt dyn MyTrait
+            tt dyn Trait
             ta Item1 =  (as MyTrait) type Item1
             ta Item2 =  (as MyTrait) type Item2
             un Union                      Union
@@ -992,8 +1031,8 @@ fn f(t: impl MyTrait<Item1 = $0
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt MyTrait
-            tt Trait
+            tt dyn MyTrait
+            tt dyn Trait
             un Union                  Union
             bt u32                      u32
             kw crate::
@@ -1021,8 +1060,8 @@ fn f(t: impl MyTrait<Item1 = u8, Item2 = $0
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt MyTrait
-            tt Trait
+            tt dyn MyTrait
+            tt dyn Trait
             un Union                  Union
             bt u32                      u32
             kw crate::
@@ -1043,7 +1082,7 @@ trait MyTrait {
 fn f(t: impl MyTrait<C = $0
 "#,
         expect![[r#"
-            ct CONST                   Unit
+            ct CONST  = Unit           Unit
             ma makro!(…) macro_rules! makro
             kw crate::
             kw dyn
@@ -1133,7 +1172,7 @@ fn completes_const_and_type_generics_separately() {
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt Trait
+            tt dyn Trait
             un Union                  Union
             bt u32                      u32
             kw crate::
@@ -1157,8 +1196,8 @@ fn completes_const_and_type_generics_separately() {
     }
             "#,
         expect![[r#"
-            ct CONST                   Unit
-            ct X                      usize
+            ct CONST  = Unit           Unit
+            ct X  = 0                 usize
             ma makro!(…) macro_rules! makro
             kw crate::
             kw dyn
@@ -1187,7 +1226,7 @@ fn completes_const_and_type_generics_separately() {
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt Trait
+            tt dyn Trait
             un Union                  Union
             bt u32                      u32
             kw crate::
@@ -1208,8 +1247,8 @@ fn completes_const_and_type_generics_separately() {
     }
             "#,
         expect![[r#"
-            ct CONST                   Unit
-            ct X                      usize
+            ct CONST  = Unit           Unit
+            ct X  = 0                 usize
             ma makro!(…) macro_rules! makro
             kw crate::
             kw dyn
@@ -1238,8 +1277,8 @@ fn completes_const_and_type_generics_separately() {
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
-            tt Bar
-            tt Trait
+            tt dyn Bar
+            tt dyn Trait
             un Union                  Union
             bt u32                      u32
             kw crate::
@@ -1260,8 +1299,8 @@ fn completes_const_and_type_generics_separately() {
     fn foo<T: Bar<Baz<(), $0> = ()>>() {}
             "#,
         expect![[r#"
-            ct CONST                   Unit
-            ct X                      usize
+            ct CONST  = Unit           Unit
+            ct X  = 0                 usize
             ma makro!(…) macro_rules! makro
             kw crate::
             kw dyn
@@ -1282,8 +1321,8 @@ fn completes_const_and_type_generics_separately() {
     }
             "#,
         expect![[r#"
-            ct CONST                   Unit
-            ct X                      usize
+            ct CONST  = Unit           Unit
+            ct X  = 0                 usize
             ma makro!(…) macro_rules! makro
             kw crate::
             kw dyn
@@ -1305,8 +1344,8 @@ fn completes_const_and_type_generics_separately() {
     }
             "#,
         expect![[r#"
-            ct CONST                   Unit
-            ct X                      usize
+            ct CONST  = Unit           Unit
+            ct X  = 0                 usize
             ma makro!(…) macro_rules! makro
             kw crate::
             kw dyn
@@ -1327,8 +1366,8 @@ fn completes_const_and_type_generics_separately() {
     }
             "#,
         expect![[r#"
-            ct CONST                   Unit
-            ct X                      usize
+            ct CONST  = Unit           Unit
+            ct X  = 0                 usize
             ma makro!(…) macro_rules! makro
             kw crate::
             kw dyn
@@ -1347,8 +1386,8 @@ fn completes_const_and_type_generics_separately() {
     impl Foo<(), $0> for () {}
             "#,
         expect![[r#"
-            ct CONST                   Unit
-            ct X                      usize
+            ct CONST  = Unit           Unit
+            ct X  = 0                 usize
             ma makro!(…) macro_rules! makro
             kw crate::
             kw dyn
@@ -1369,8 +1408,8 @@ fn completes_const_and_type_generics_separately() {
     fn foo<T: Bar<X$0, ()>>() {}
             "#,
         expect![[r#"
-            ct CONST                   Unit
-            ct X                      usize
+            ct CONST  = Unit           Unit
+            ct X  = 0                 usize
             ma makro!(…) macro_rules! makro
             kw crate::
             kw dyn
@@ -1388,7 +1427,7 @@ struct S<'a, 'b, const C: usize, T>(core::marker::PhantomData<&'a &'b T>);
 fn foo<'a>() { S::<F$0, _>; }
         "#,
         expect![[r#"
-            ct CONST                   Unit
+            ct CONST  = Unit           Unit
             ma makro!(…) macro_rules! makro
             kw crate::
             kw dyn
@@ -1405,7 +1444,7 @@ struct S<'a, 'b, const C: usize, T>(core::marker::PhantomData<&'a &'b T>);
 fn foo<'a>() { S::<'static, 'static, F$0, _>; }
         "#,
         expect![[r#"
-            ct CONST                   Unit
+            ct CONST  = Unit           Unit
             ma makro!(…) macro_rules! makro
             kw crate::
             kw dyn
@@ -1469,6 +1508,255 @@ impl outer::$0 for Bar { }
         expect![[r#"
             md inner::
             tt Foo
+        "#]],
+    );
+}
+
+#[test]
+fn complete_traits_in_type_pos_edition_2018() {
+    check_with_config(
+        TEST_CONFIG,
+        r#"
+//- /a.rs crate:a edition:2018
+type X = $0;
+"#,
+        expect![[r#"
+            en Enum                    Enum
+            ma makro!(…) macro_rules! makro
+            md module::
+            st Record                Record
+            st Tuple                  Tuple
+            st Unit                    Unit
+            tt dyn Trait
+            ta X
+            un Union                  Union
+            bt u32                      u32
+        "#]],
+    );
+    check_with_config(
+        CompletionConfig { enable_auto_dyn: false, ..TEST_CONFIG },
+        r#"
+//- /a.rs crate:a edition:2018
+type X = $0;
+"#,
+        expect![[r#"
+            en Enum                    Enum
+            ma makro!(…) macro_rules! makro
+            md module::
+            st Record                Record
+            st Tuple                  Tuple
+            st Unit                    Unit
+            tt Trait
+            ta X
+            un Union                  Union
+            bt u32                      u32
+        "#]],
+    );
+}
+
+#[test]
+fn complete_traits_in_type_pos_edition_2021() {
+    check_with_config(
+        TEST_CONFIG,
+        r#"
+//- /a.rs crate:a edition:2021
+type X = $0;
+"#,
+        expect![[r#"
+            en Enum                    Enum
+            ma makro!(…) macro_rules! makro
+            md module::
+            st Record                Record
+            st Tuple                  Tuple
+            st Unit                    Unit
+            tt dyn Trait
+            ta X
+            un Union                  Union
+            bt u32                      u32
+        "#]],
+    );
+    check_with_config(
+        CompletionConfig { enable_auto_dyn: false, ..TEST_CONFIG },
+        r#"
+//- /a.rs crate:a edition:2021
+type X = $0;
+"#,
+        expect![[r#"
+            en Enum                    Enum
+            ma makro!(…) macro_rules! makro
+            md module::
+            st Record                Record
+            st Tuple                  Tuple
+            st Unit                    Unit
+            ta X
+            un Union                  Union
+            bt u32                      u32
+        "#]],
+    );
+    check_with_config(
+        TEST_CONFIG,
+        r#"
+//- /a.rs crate:a edition:2021
+fn f(_: $0)
+"#,
+        expect![[r#"
+            en Enum                    Enum
+            ma makro!(…) macro_rules! makro
+            md module::
+            st Record                Record
+            st Tuple                  Tuple
+            st Unit                    Unit
+            un Union                  Union
+            bt u32                      u32
+        "#]],
+    );
+    check_with_config(
+        CompletionConfig { enable_auto_dyn: false, ..TEST_CONFIG },
+        r#"
+//- /a.rs crate:a edition:2021
+fn f(_: $0)
+"#,
+        expect![[r#"
+            en Enum                    Enum
+            ma makro!(…) macro_rules! makro
+            md module::
+            st Record                Record
+            st Tuple                  Tuple
+            st Unit                    Unit
+            un Union                  Union
+            bt u32                      u32
+        "#]],
+    );
+    check_with_config(
+        TEST_CONFIG,
+        r#"
+//- /a.rs crate:a edition:2021
+fn f(_: &$0)
+"#,
+        expect![[r#"
+            en Enum                    Enum
+            ma makro!(…) macro_rules! makro
+            md module::
+            st Record                Record
+            st Tuple                  Tuple
+            st Unit                    Unit
+            tt dyn Trait
+            un Union                  Union
+            bt u32                      u32
+        "#]],
+    );
+    check_with_config(
+        CompletionConfig { enable_auto_dyn: false, ..TEST_CONFIG },
+        r#"
+//- /a.rs crate:a edition:2021
+fn f(_: &$0)
+"#,
+        expect![[r#"
+            en Enum                    Enum
+            ma makro!(…) macro_rules! makro
+            md module::
+            st Record                Record
+            st Tuple                  Tuple
+            st Unit                    Unit
+            un Union                  Union
+            bt u32                      u32
+        "#]],
+    );
+    check_with_config(
+        TEST_CONFIG,
+        r#"
+//- /a.rs crate:a edition:2021
+fn f() -> $0
+"#,
+        expect![[r#"
+            en Enum                    Enum
+            ma makro!(…) macro_rules! makro
+            md module::
+            st Record                Record
+            st Tuple                  Tuple
+            st Unit                    Unit
+            un Union                  Union
+            bt u32                      u32
+        "#]],
+    );
+    check_with_config(
+        CompletionConfig { enable_auto_dyn: false, ..TEST_CONFIG },
+        r#"
+//- /a.rs crate:a edition:2021
+fn f() -> $0
+"#,
+        expect![[r#"
+            en Enum                    Enum
+            ma makro!(…) macro_rules! makro
+            md module::
+            st Record                Record
+            st Tuple                  Tuple
+            st Unit                    Unit
+            un Union                  Union
+            bt u32                      u32
+        "#]],
+    );
+    check_with_config(
+        TEST_CONFIG,
+        r#"
+//- /a.rs crate:a edition:2021
+fn f() -> &$0
+"#,
+        expect![[r#"
+            en Enum                    Enum
+            ma makro!(…) macro_rules! makro
+            md module::
+            st Record                Record
+            st Tuple                  Tuple
+            st Unit                    Unit
+            tt dyn Trait
+            un Union                  Union
+            bt u32                      u32
+        "#]],
+    );
+    check_with_config(
+        CompletionConfig { enable_auto_dyn: false, ..TEST_CONFIG },
+        r#"
+//- /a.rs crate:a edition:2021
+fn f() -> &$0
+"#,
+        expect![[r#"
+            en Enum                    Enum
+            ma makro!(…) macro_rules! makro
+            md module::
+            st Record                Record
+            st Tuple                  Tuple
+            st Unit                    Unit
+            un Union                  Union
+            bt u32                      u32
+        "#]],
+    );
+}
+
+#[test]
+fn complete_traits_in_type_pos_edition_2021_with_dyn() {
+    check_with_config(
+        TEST_CONFIG,
+        r#"
+//- /a.rs crate:a edition:2021
+type X = dyn $0;
+"#,
+        expect![[r#"
+            ma makro!(…) macro_rules! makro
+            md module::
+            tt Trait
+        "#]],
+    );
+    check_with_config(
+        CompletionConfig { enable_auto_dyn: false, ..TEST_CONFIG },
+        r#"
+//- /a.rs crate:a edition:2021
+type X = dyn $0;
+"#,
+        expect![[r#"
+            ma makro!(…) macro_rules! makro
+            md module::
+            tt Trait
         "#]],
     );
 }

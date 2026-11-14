@@ -87,10 +87,8 @@ pub(crate) struct TestProps {
     // Regexes that should be expected, in order, on standard out
     pub(crate) regex_error_patterns: Vec<String>,
     /// Edition selected by an `//@ edition` directive, if any.
-    ///
-    /// Automatically added to `compile_flags` during directive processing.
     pub(crate) edition: Option<Edition>,
-    // Extra flags to pass to the compiler
+    // Extra flags to pass to the compiler.
     pub(crate) compile_flags: Vec<String>,
     // Extra flags to pass when the compiled code is run (such as --bench)
     pub(crate) run_flags: Vec<String>,
@@ -215,9 +213,14 @@ pub(crate) struct TestProps {
     pub(crate) disable_gdb_pretty_printers: bool,
     /// Compare the output by lines, rather than as a single string.
     pub(crate) compare_output_by_lines: bool,
+    /// Use CCI (`--read-doc-meta` and `--write-doc-meta`) merge mode.
+    pub(crate) use_rustdoc_cci_doc_meta_merge: bool,
+    /// Where the `//@ should-fail` instruction is present.
+    pub(crate) should_fail: bool,
 }
 
 mod directives {
+    pub(crate) const ACT_AS_STABLE: &str = "act-as-stable";
     pub(crate) const ERROR_PATTERN: &str = "error-pattern";
     pub(crate) const REGEX_ERROR_PATTERN: &str = "regex-error-pattern";
     pub(crate) const COMPILE_FLAGS: &str = "compile-flags";
@@ -262,6 +265,7 @@ mod directives {
     pub(crate) const MINICORE_COMPILE_FLAGS: &str = "minicore-compile-flags";
     pub(crate) const DISABLE_GDB_PRETTY_PRINTERS: &str = "disable-gdb-pretty-printers";
     pub(crate) const COMPARE_OUTPUT_BY_LINES: &str = "compare-output-by-lines";
+    pub(crate) const USE_RUSTDOC_CCI_DOC_META_MERGE: &str = "use-rustdoc-cci-doc-meta-merge";
 }
 
 impl TestProps {
@@ -319,6 +323,8 @@ impl TestProps {
             dont_require_annotations: Default::default(),
             disable_gdb_pretty_printers: false,
             compare_output_by_lines: false,
+            use_rustdoc_cci_doc_meta_merge: false,
+            should_fail: false,
         }
     }
 
@@ -396,12 +402,6 @@ impl TestProps {
                     self.exec_env.push(((*key).to_owned(), val))
                 }
             }
-        }
-
-        if let Some(edition) = self.edition.or(config.edition) {
-            // The edition is added at the start, since flags from //@compile-flags must be passed
-            // to rustc last.
-            self.compile_flags.insert(0, format!("--edition={edition}"));
         }
     }
 
@@ -548,9 +548,12 @@ fn iter_directives(
     };
 
     for directive_str in extra_directives {
-        let directive_line = line_directive(testfile, LineNumber::ZERO, directive_str)
-            .unwrap_or_else(|| panic!("bad extra-directive line: {directive_str:?}"));
-        it(&directive_line);
+        if let Some(Ok(directive_line)) = line_directive(testfile, LineNumber::ZERO, directive_str)
+        {
+            it(&directive_line);
+        } else {
+            panic!("bad extra-directive line: {directive_str:?}")
+        }
     }
 
     for directive_line in &file_directives.lines {
@@ -849,30 +852,6 @@ pub(crate) fn extract_llvm_version_from_binary(binary_path: &str) -> Option<Vers
         }
     }
     None
-}
-
-pub(crate) fn find_gcc_supported_targets(sysroot_base: &Utf8Path, host: &str) -> Vec<String> {
-    // E.g. `lib/rustlib/x86_64-unknown-linux-gnu/codegen-backends/lib`.
-    let backends_dir =
-        sysroot_base.join("lib").join("rustlib").join(host).join("codegen-backends").join("lib");
-
-    match std::fs::read_dir(&backends_dir) {
-        Ok(entries) => {
-            // Search for `aarch64-unknown-linux-gnu/libgccjit.so` et cetera.
-            let target_tuples: Vec<_> = entries
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| entry.path().join("libgccjit.so").exists())
-                .filter_map(|entry| entry.file_name().into_string().ok())
-                .collect();
-
-            if target_tuples.is_empty() {
-                panic!("did not find `libgccjit.so` for any target in {backends_dir}");
-            }
-
-            target_tuples
-        }
-        Err(e) => panic!("unable to find `libgccjit.so` for any target in {backends_dir}: {e:?}",),
-    }
 }
 
 /// Takes a directive of the form `"<version1> [- <version2>]"`, returns the numeric representation
@@ -1255,7 +1234,7 @@ fn ignore_unsupported_backend_target(config: &Config, line: &DirectiveLine<'_>) 
         return IgnoreDecision::Continue;
     };
 
-    if !config.gcc_supported_target_tuples.iter().any(|t| t == target) {
+    if target != "x86_64-unknown-linux-gnu" {
         IgnoreDecision::Ignore {
             reason: format!(
                 "backend `{}` cannot build for target `{target}`",

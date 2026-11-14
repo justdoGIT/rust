@@ -122,7 +122,6 @@ fn completes_where() {
             st Record (adds ->)      Record
             st Tuple (adds ->)        Tuple
             st Unit (adds ->)          Unit
-            tt Trait (adds ->)
             un Union (adds ->)        Union
             bt u32 (adds ->)            u32
             kw crate:: (adds ->)
@@ -355,7 +354,7 @@ fn bar() {
 }
     "#,
         expect![[r#"
-            ct CONST                                     Unit
+            ct CONST  = Unit                             Unit
             en Enum                                      Enum
             fn bar()                                     fn()
             fn foo()                                     fn()
@@ -422,7 +421,7 @@ macro_rules! foo {
 foo!(f$0);
     "#,
         expect![[r#"
-            ct BAR                   u8
+            ct BAR  = f              u8
             fn foo()         fn() -> u8
             ma foo!(…) macro_rules! foo
             bt u32                  u32
@@ -434,6 +433,42 @@ foo!(f$0);
             kw if let
             kw loop
             kw match
+            kw self::
+            kw true
+            kw unsafe
+            kw while
+            kw while let
+        "#]],
+    );
+}
+
+#[test]
+fn const_eval_label_details() {
+    check(
+        r#"
+pub const MAX: u32 = !0;
+pub const MIN: u32 = 0;
+pub const MNOEVAL: u32 = unknown();
+
+fn main() {
+    let x = M$0
+}
+    "#,
+        expect![[r#"
+            ct MAX  = 4294967295    u32
+            ct MIN  = 0             u32
+            ct MNOEVAL  = unknown() u32
+            fn main()              fn()
+            bt u32                  u32
+            kw const
+            kw crate::
+            kw false
+            kw for
+            kw if
+            kw if let
+            kw loop
+            kw match
+            kw return
             kw self::
             kw true
             kw unsafe

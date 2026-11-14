@@ -9,7 +9,6 @@
 // FIXME(#147881): *disable* the feature again for minicore as otherwise that will fail to build.
 //@[riscv] minicore-compile-flags: -Ctarget-feature=-d
 //@[riscv] needs-llvm-components: riscv
-//@ ignore-backends: gcc
 //@ add-minicore
 
 #![feature(no_core, riscv_target_feature)]
@@ -19,5 +18,4 @@ extern crate minicore;
 use minicore::*;
 
 //~? WARN must be disabled to ensure that the ABI of the current target can be implemented correctly
-//[riscv]~? WARN unstable feature specified for `-Ctarget-feature`
 //[x86]~? WARN use a soft-float target instead

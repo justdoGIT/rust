@@ -24,7 +24,7 @@ use rustc_index::bit_set::DenseBitSet;
 use rustc_index::{Idx, IndexSlice, IndexVec};
 use rustc_macros::{StableHash, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
 use rustc_serialize::{Decodable, Encodable};
-use rustc_span::{DUMMY_SP, Span, Spanned, Symbol};
+use rustc_span::{DUMMY_SP, Span, Spanned, Symbol, bug};
 use tracing::{debug, trace};
 
 pub use self::query::*;
@@ -32,15 +32,14 @@ use crate::mir::interpret::{AllocRange, Scalar};
 use crate::ty::codec::{TyDecoder, TyEncoder};
 use crate::ty::print::{FmtPrinter, Printer, pretty_print_const, with_no_trimmed_paths};
 use crate::ty::{
-    self, GenericArg, GenericArgsRef, Instance, InstanceKind, List, ShimKind, Ty, TyCtxt,
+    self, GenericArg, GenericArgs, Instance, InstanceKind, List, ShimKind, Ty, TyCtxt,
     TypeVisitableExt, TypingEnv, UserTypeAnnotationIndex,
 };
 
-mod basic_blocks;
+pub mod basic_blocks;
 mod consts;
 pub mod coverage;
 mod generic_graph;
-pub mod generic_graphviz;
 pub mod graphviz;
 pub mod interpret;
 pub mod pretty;
@@ -310,14 +309,14 @@ pub struct Body<'tcx> {
 
     pub tainted_by_errors: Option<ErrorGuaranteed>,
 
-    /// Coverage information collected from THIR/MIR during MIR building,
-    /// to be used by the `InstrumentCoverage` pass.
+    /// Coverage information collected at the THIR/MIR boundary during MIR
+    /// building, to be used by the `InstrumentCoverage` pass.
     ///
     /// Only present if coverage is enabled and this function is eligible.
     /// Boxed to limit space overhead in non-coverage builds.
     #[type_foldable(identity)]
     #[type_visitable(ignore)]
-    pub coverage_info_hi: Option<Box<coverage::CoverageInfoHi>>,
+    pub coverage_early_info: Option<Box<coverage::CoverageEarlyInfo>>,
 
     /// Per-function coverage information added by the `InstrumentCoverage`
     /// pass, to be used in conjunction with the coverage statements injected
@@ -327,7 +326,7 @@ pub struct Body<'tcx> {
     /// is not eligible for coverage, then this should always be `None`.
     #[type_foldable(identity)]
     #[type_visitable(ignore)]
-    pub function_coverage_info: Option<Box<coverage::FunctionCoverageInfo>>,
+    pub coverage_mir_info: Option<Box<coverage::CoverageMirInfo>>,
 }
 
 impl<'tcx> Body<'tcx> {
@@ -369,8 +368,8 @@ impl<'tcx> Body<'tcx> {
             is_polymorphic: false,
             injection_phase: None,
             tainted_by_errors,
-            coverage_info_hi: None,
-            function_coverage_info: None,
+            coverage_early_info: None,
+            coverage_mir_info: None,
         };
         body.is_polymorphic = body.has_non_region_param();
         body
@@ -400,8 +399,8 @@ impl<'tcx> Body<'tcx> {
             is_polymorphic: false,
             injection_phase: None,
             tainted_by_errors: None,
-            coverage_info_hi: None,
-            function_coverage_info: None,
+            coverage_early_info: None,
+            coverage_mir_info: None,
         };
         body.is_polymorphic = body.has_non_region_param();
         body
@@ -413,35 +412,34 @@ impl<'tcx> Body<'tcx> {
     }
 
     pub fn typing_env(&self, tcx: TyCtxt<'tcx>) -> TypingEnv<'tcx> {
-        if tcx.use_typing_mode_post_typeck_until_borrowck() {
+        if tcx.use_typing_mode_post_typeck_through_borrowck() {
             match self.phase {
-                MirPhase::Built if let Some(def_id) = self.source.def_id().as_local() => {
+                // `analysis_cleanup_passes` should use `PostBorrowck`, but doing so would
+                // complicate the code, and none of those passes seems to care.
+                MirPhase::Built | MirPhase::Analysis(AnalysisPhase::Initial) => {
+                    let local_def_id = self
+                        .source
+                        .def_id()
+                        .as_local()
+                        .expect("We only build MIR for local bodies");
                     TypingEnv::new(
                         tcx.param_env(self.source.def_id()),
-                        ty::TypingMode::borrowck(tcx, def_id),
+                        ty::TypingMode::borrowck(tcx, local_def_id),
                     )
                 }
-                MirPhase::Analysis(_) if let Some(def_id) = self.source.def_id().as_local() => {
-                    TypingEnv::new(
-                        tcx.param_env(self.source.def_id()),
-                        ty::TypingMode::post_borrowck_analysis(tcx, def_id),
-                    )
-                }
-                MirPhase::Built | MirPhase::Analysis(_) => {
-                    // This branch happens for drop glue and fn ptr shims.
-                    // FIXME: why do we do any of this analysis on drop glue etc?
-                    // This should ideally all be skipped.
+                MirPhase::Analysis(AnalysisPhase::PostCleanup) | MirPhase::Runtime(_) => {
                     TypingEnv::post_analysis(tcx, self.source.def_id())
                 }
-                MirPhase::Runtime(_) => TypingEnv::post_analysis(tcx, self.source.def_id()),
             }
         } else {
             match self.phase {
-                MirPhase::Built | MirPhase::Analysis(_) => TypingEnv::new(
+                MirPhase::Built | MirPhase::Analysis(AnalysisPhase::Initial) => TypingEnv::new(
                     tcx.param_env(self.source.def_id()),
                     ty::TypingMode::non_body_analysis(),
                 ),
-                MirPhase::Runtime(_) => TypingEnv::post_analysis(tcx, self.source.def_id()),
+                MirPhase::Analysis(AnalysisPhase::PostCleanup) | MirPhase::Runtime(_) => {
+                    TypingEnv::post_analysis(tcx, self.source.def_id())
+                }
             }
         }
     }
@@ -1303,6 +1301,7 @@ rustc_index::newtype_index! {
 }
 
 impl BasicBlock {
+    #[inline]
     pub fn start_location(self) -> Location {
         Location { block: self, statement_index: 0 }
     }
@@ -1342,11 +1341,33 @@ pub struct BasicBlockData<'tcx> {
 }
 
 impl<'tcx> BasicBlockData<'tcx> {
-    pub fn new(terminator: Option<Terminator<'tcx>>, is_cleanup: bool) -> BasicBlockData<'tcx> {
+    pub fn new(terminator: Terminator<'tcx>, is_cleanup: bool) -> BasicBlockData<'tcx> {
         BasicBlockData::new_stmts(Vec::new(), terminator, is_cleanup)
     }
 
     pub fn new_stmts(
+        statements: Vec<Statement<'tcx>>,
+        terminator: Terminator<'tcx>,
+        is_cleanup: bool,
+    ) -> BasicBlockData<'tcx> {
+        BasicBlockData {
+            statements,
+            after_last_stmt_debuginfos: StmtDebugInfos::default(),
+            terminator: Some(terminator),
+            is_cleanup,
+        }
+    }
+
+    /// This is being phased out. Use [`BasicBlockData::new`] instead.
+    pub fn maybe_unterminated(
+        terminator: Option<Terminator<'tcx>>,
+        is_cleanup: bool,
+    ) -> BasicBlockData<'tcx> {
+        BasicBlockData::maybe_unterminated_stmts(Vec::new(), terminator, is_cleanup)
+    }
+
+    /// This is being phased out. Use [`BasicBlockData::new_stmts`] instead.
+    pub fn maybe_unterminated_stmts(
         statements: Vec<Statement<'tcx>>,
         terminator: Option<Terminator<'tcx>>,
         is_cleanup: bool,
@@ -1690,7 +1711,7 @@ pub fn find_self_call<'tcx>(
     body: &Body<'tcx>,
     local: Local,
     block: BasicBlock,
-) -> Option<(DefId, GenericArgsRef<'tcx>)> {
+) -> Option<(DefId, GenericArgs<'tcx>)> {
     debug!("find_self_call(local={:?}): terminator={:?}", local, body[block].terminator);
     if let Some(Terminator { kind: TerminatorKind::Call { func, args, .. }, .. }) =
         &body[block].terminator
@@ -1732,11 +1753,11 @@ mod size_asserts {
 
     use super::*;
     // tidy-alphabetical-start
-    static_assert_size!(BasicBlockData<'_>, 144);
+    static_assert_size!(BasicBlockData<'_>, 136);
     static_assert_size!(LocalDecl<'_>, 40);
     static_assert_size!(SourceScopeData<'_>, 64);
     static_assert_size!(Statement<'_>, 40);
-    static_assert_size!(Terminator<'_>, 104);
+    static_assert_size!(Terminator<'_>, 96);
     static_assert_size!(VarDebugInfo<'_>, 88);
     // tidy-alphabetical-end
 }

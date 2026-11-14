@@ -11,6 +11,7 @@ use rustc_span::def_id::CRATE_DEF_ID;
 use rustc_span::{DUMMY_SP, Span, sym};
 use smallvec::{SmallVec, smallvec};
 
+use crate::infer::InferCtxt;
 use crate::traits::query::NoSolution;
 use crate::traits::query::type_op::QueryTypeOp;
 use crate::traits::{ObligationCtxt, wf};
@@ -20,7 +21,7 @@ impl<'tcx> QueryTypeOp<'tcx> for ImpliedOutlivesBounds<'tcx> {
     type QueryResponse = Vec<OutlivesBound<'tcx>>;
 
     fn try_fast_path(
-        _tcx: TyCtxt<'tcx>,
+        _infcx: &InferCtxt<'tcx>,
         key: &ParamEnvAnd<'tcx, Self>,
     ) -> Option<Self::QueryResponse> {
         // Don't go into the query for things that can't possibly have lifetimes.
@@ -38,14 +39,6 @@ impl<'tcx> QueryTypeOp<'tcx> for ImpliedOutlivesBounds<'tcx> {
         canonicalized: CanonicalQueryInput<'tcx, ParamEnvAnd<'tcx, Self>>,
     ) -> Result<CanonicalQueryResponse<'tcx, Self::QueryResponse>, NoSolution> {
         tcx.implied_outlives_bounds((canonicalized, false))
-    }
-
-    fn perform_locally_with_next_solver(
-        ocx: &ObligationCtxt<'_, 'tcx>,
-        key: ParamEnvAnd<'tcx, Self>,
-        _span: Span,
-    ) -> Result<Self::QueryResponse, NoSolution> {
-        query_compute_implied_outlives_bounds(ocx, key.param_env, key.value.ty, false)
     }
 }
 
@@ -72,7 +65,7 @@ pub fn compute_implied_outlives_bounds_inner<'tcx>(
             continue;
         }
 
-        let arg = ocx.infcx.resolve_vars_if_possible(arg);
+        let arg = ocx.infcx.deeply_resolve_ignoring_regions(arg);
         // From the full set of obligations, just filter down to the region relationships.
         for obligation in
             wf::unnormalized_obligations(ocx.infcx, param_env, arg, DUMMY_SP, CRATE_DEF_ID)
@@ -172,7 +165,7 @@ pub fn query_compute_implied_outlives_bounds<'tcx>(
     /* if cfg!(debug_assertions) {
         match ocx.infcx.typing_mode_raw() {
             TypingMode::Typeck { defining_opaque_types_and_generators: opaque_types }
-            | TypingMode::PostTypeckUntilBorrowck { defining_opaque_types: opaque_types }
+            | TypingMode::PostTypeckThroughBorrowck { defining_opaque_types: opaque_types }
             | TypingMode::PostBorrowck { defined_opaque_types: opaque_types } => {
                 assert!(opaque_types.is_empty())
             }

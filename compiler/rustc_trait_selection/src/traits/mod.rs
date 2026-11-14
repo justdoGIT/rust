@@ -32,12 +32,13 @@ use rustc_macros::TypeVisitable;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::error::{ExpectedFound, TypeError};
 use rustc_middle::ty::{
-    self, BottomUpFolder, Clause, GenericArgs, GenericArgsRef, RegionExt, Ty, TyCtxt, TypeFoldable,
+    self, BottomUpFolder, CallerBoundsIterator, Clause, GenericArgs, Ty, TyCtxt, TypeFoldable,
     TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypingMode,
     Unnormalized, Upcast,
 };
 use rustc_span::Span;
 use rustc_span::def_id::DefId;
+use thin_vec::ThinVec;
 use tracing::{debug, instrument};
 
 pub use self::coherence::{
@@ -66,7 +67,7 @@ pub use self::specialize::{
 pub use self::structural_normalize::StructurallyNormalizeExt;
 pub use self::util::{
     BoundVarReplacer, PlaceholderReplacer, elaborate, expand_trait_aliases, impl_item_is_final,
-    sizedness_fast_path, supertrait_def_ids, supertraits, transitive_bounds_that_define_assoc_item,
+    implicit_fast_path, supertrait_def_ids, supertraits, transitive_bounds_that_define_assoc_item,
     upcast_choices, with_replaced_escaping_bound_vars,
 };
 use crate::error_reporting::InferCtxtErrorExt;
@@ -105,6 +106,12 @@ impl<'tcx> FulfillmentError<'tcx> {
                 false
             }
         }
+    }
+}
+
+impl<'tcx> EngineError<'tcx> for FulfillmentError<'tcx> {
+    fn try_report_errors(infcx: &InferCtxt<'tcx>, errors: ThinVec<Self>) {
+        infcx.err_ctxt().report_fulfillment_errors(errors);
     }
 }
 
@@ -232,7 +239,8 @@ fn pred_known_to_hold_modulo_regions<'tcx>(
         // is not smart enough, so we fall back to fulfillment when we're not certain
         // that an obligation holds or not. Even still, we must make sure that
         // the we do no inference in the process of checking this obligation.
-        let goal = infcx.resolve_vars_if_possible((obligation.predicate, obligation.param_env));
+        let goal =
+            infcx.deeply_resolve_ignoring_regions((obligation.predicate, obligation.param_env));
         infcx.probe(|_| {
             let ocx = ObligationCtxt::new(infcx);
             ocx.register_obligation(obligation);
@@ -240,7 +248,7 @@ fn pred_known_to_hold_modulo_regions<'tcx>(
             let errors = ocx.evaluate_obligations_error_on_ambiguity();
             match errors {
                 // Only known to hold if we did no inference.
-                TraitErrors::NoErrors => infcx.resolve_vars_if_possible(goal) == goal,
+                TraitErrors::NoErrors => infcx.deeply_resolve_ignoring_regions(goal) == goal,
 
                 TraitErrors::HasErrors(errors) => {
                     debug!(?errors);
@@ -348,15 +356,18 @@ fn do_normalize_clauses<'tcx>(
     let ocx = ObligationCtxt::new_with_diagnostics(&infcx);
     // FIXME: `elaborated_env` is not really rigid. We do this to be
     // consistent with the old solver.
-    let elaborated_env = if tcx.next_trait_solver_globally()
-        && !tcx.disable_param_env_normalization_hack()
-    {
-        let elaborated_env = ty::set_type_aliases_to_rigid(tcx, elaborated_env);
-        let elaborated_env = set_projection_term_to_non_rigid(tcx, elaborated_env.caller_bounds());
-        ty::ParamEnv::new(tcx.mk_clauses_from_iter(elaborated_env))
-    } else {
-        elaborated_env
-    };
+    let elaborated_env =
+        if tcx.next_trait_solver_globally() && !tcx.disable_param_env_normalization_hack() {
+            let elaborated_env = ty::set_type_aliases_to_rigid(tcx, elaborated_env);
+            let elaborated_env = set_projection_term_to_non_rigid(
+                tcx,
+                elaborated_env.caller_bounds().all_clauses(tcx).iter(),
+            );
+
+            ty::ParamEnv::new(tcx, elaborated_env)
+        } else {
+            elaborated_env
+        };
     let clauses = ocx.normalize(&cause, elaborated_env, Unnormalized::new_wip(clauses));
     let clauses = if tcx.next_trait_solver_globally() {
         if !tcx.disable_param_env_normalization_hack() {
@@ -403,9 +414,9 @@ fn do_normalize_clauses<'tcx>(
     //
     // FIXME: We should avoid interning clauses both here and at the
     // caller sites. We should also avoid cloning if possible.
-    let normalized_env = ty::ParamEnv::new(tcx.mk_clauses(&clauses));
+    let normalized_env = ty::ParamEnv::new(tcx, clauses.iter().copied());
     let _errors = infcx.resolve_regions(cause.body_def_id, normalized_env, []);
-    match infcx.fully_resolve(clauses.clone()) {
+    match infcx.deeply_resolve_via_region_graph(clauses.clone()) {
         Ok(clauses) => clauses,
         Err(fixup_err) => {
             // The first folder only replaces infers from normalization failure. We might not have
@@ -452,7 +463,7 @@ pub fn normalize_param_env_or_error<'tcx>(
     // can be sure that no errors should occur.
     let mut clauses: Vec<_> = util::elaborate(
         tcx,
-        unnormalized_env.caller_bounds().into_iter().map(|clause| {
+        unnormalized_env.caller_bounds().all_clauses(tcx).iter().map(|clause| {
             if tcx.features().generic_const_exprs() || tcx.next_trait_solver_globally() {
                 return clause;
             }
@@ -525,7 +536,7 @@ pub fn normalize_param_env_or_error<'tcx>(
 
     debug!("normalize_param_env_or_error: elaborated-clauses={:?}", clauses);
 
-    let elaborated_env = ty::ParamEnv::new(tcx.mk_clauses(&clauses));
+    let elaborated_env = ty::ParamEnv::new(tcx, clauses.iter().copied());
     if !elaborated_env.has_aliases() {
         return elaborated_env;
     }
@@ -566,14 +577,14 @@ pub fn normalize_param_env_or_error<'tcx>(
     // here. I believe they should not matter, because we are ignoring TypeOutlives param-env
     // clauses here anyway. Keeping them here anyway because it seems safer.
     let outlives_env = non_outlives_clauses.iter().chain(&outlives_clauses).cloned();
-    let outlives_env = ty::ParamEnv::new(tcx.mk_clauses_from_iter(outlives_env));
+    let outlives_env = ty::ParamEnv::new(tcx, outlives_env);
     let outlives_clauses = do_normalize_clauses(tcx, cause, outlives_env, outlives_clauses);
     debug!("normalize_param_env_or_error: outlives clauses={:?}", outlives_clauses);
 
     let mut clauses = non_outlives_clauses;
     clauses.extend(outlives_clauses);
     debug!("normalize_param_env_or_error: final clauses={:?}", clauses);
-    ty::ParamEnv::new(tcx.mk_clauses(&clauses))
+    ty::ParamEnv::new(tcx, clauses)
 }
 
 #[derive(Debug)]
@@ -631,7 +642,7 @@ pub fn try_evaluate_const<'tcx, E: Debug>(
     normalize_ty: impl FnOnce(Unnormalized<'tcx, Ty<'tcx>>) -> Result<Ty<'tcx>, E>,
 ) -> Result<ty::Const<'tcx>, EvaluateConstErr<E>> {
     let tcx = infcx.tcx;
-    let ct = infcx.resolve_vars_if_possible(ct);
+    let ct = infcx.deeply_resolve_ignoring_regions(ct);
     debug!(?ct);
 
     match ct.kind() {
@@ -684,9 +695,11 @@ pub fn try_evaluate_const<'tcx, E: Debug>(
                                         tcx,
                                         alias_const.args,
                                     );
-                                    let typing_env = infcx
+                                    let ty::PseudoCanonicalInput { typing_env, value: args } = infcx
                                         .typing_env(tcx.erase_and_anonymize_regions(param_env))
-                                        .with_post_analysis_normalized(tcx);
+                                        .with_post_analysis_normalized_invalidating_rigid_aliases(
+                                            tcx, args,
+                                        );
                                     (args, typing_env)
                                 }
                             }
@@ -697,10 +710,13 @@ pub fn try_evaluate_const<'tcx, E: Debug>(
                             }
                         }
                     } else {
-                        let typing_env = infcx
+                        let ty::PseudoCanonicalInput { typing_env, value: args } = infcx
                             .typing_env(tcx.erase_and_anonymize_regions(param_env))
-                            .with_post_analysis_normalized(tcx);
-                        (alias_const.args, typing_env)
+                            .with_post_analysis_normalized_invalidating_rigid_aliases(
+                                tcx,
+                                alias_const.args,
+                            );
+                        (args, typing_env)
                     }
                 }
                 Some((def_id, ty::AnonConstKind::RepeatExprCount)) => {
@@ -792,8 +808,8 @@ pub fn try_evaluate_const<'tcx, E: Debug>(
 /// args when they're not actually needed to evaluate a constant.
 fn replace_param_and_infer_args_with_placeholder<'tcx>(
     tcx: TyCtxt<'tcx>,
-    args: GenericArgsRef<'tcx>,
-) -> GenericArgsRef<'tcx> {
+    args: GenericArgs<'tcx>,
+) -> GenericArgs<'tcx> {
     struct ReplaceParamAndInferWithPlaceholder<'tcx> {
         tcx: TyCtxt<'tcx>,
         idx: ty::BoundVar,
@@ -868,7 +884,7 @@ pub fn impossible_clauses<'tcx>(tcx: TyCtxt<'tcx>, clauses: Vec<ty::Clause<'tcx>
 
 fn instantiate_and_check_impossible_clauses<'tcx>(
     tcx: TyCtxt<'tcx>,
-    key: (DefId, GenericArgsRef<'tcx>),
+    key: (DefId, GenericArgs<'tcx>),
 ) -> bool {
     debug!("instantiate_and_check_impossible_clauses(key={:?})", key);
 

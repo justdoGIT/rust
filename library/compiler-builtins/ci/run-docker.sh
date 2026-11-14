@@ -58,7 +58,7 @@ run() {
             "IMAGE=${DOCKER_BASE_IMAGE:-rustlang/rust:nightly}"
         )
         run_args=(-v "compiler-builtins-cache:/builtins-target")
-        run_cmd="$run_cmd HOME=/tmp" "USING_CONTAINER_RUSTC=1"
+        run_cmd="$run_cmd HOME=/tmp USING_CONTAINER_RUSTC=1"
     fi
 
     if [ -d compiler-rt ]; then
@@ -76,6 +76,7 @@ run() {
         -e CI \
         -e CARGO_TARGET_DIR=/builtins-target \
         -e CARGO_TERM_COLOR \
+        -e CARGO_BUILD_WARNINGS \
         -e LIBM_BUILD_VERBOSE \
         -e MAY_SKIP_LIBM_CI \
         -e RUSTFLAGS \

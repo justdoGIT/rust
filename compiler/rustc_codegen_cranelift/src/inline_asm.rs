@@ -5,9 +5,9 @@ use std::fmt::Write;
 use cranelift_codegen::isa::CallConv;
 use rustc_abi::CanonAbi;
 use rustc_ast::ast::{InlineAsmOptions, InlineAsmTemplatePiece};
-use rustc_hir::attrs::lang_items::LangItem;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_middle::mir::interpret::{GlobalAlloc, PointerArithmetic, Scalar as ConstScalar};
-use rustc_middle::ty::layout::FnAbiOf;
+use rustc_middle::ty::layout::{FnAbiOf, HasTypingEnv as _};
 use rustc_span::sym;
 use rustc_target::asm::*;
 use rustc_target::spec::Arch;
@@ -175,7 +175,7 @@ pub(crate) fn codegen_inline_asm_terminator<'tcx>(
                 if let ty::FnDef(def_id, args) = *const_.ty().kind() {
                     let instance = ty::Instance::resolve_for_fn_ptr(
                         fx.tcx,
-                        ty::TypingEnv::fully_monomorphized(),
+                        fx.typing_env(),
                         def_id,
                         args.no_bound_vars().unwrap(),
                     )
@@ -443,11 +443,12 @@ impl<'tcx> InlineAssemblyGenerator<'_, 'tcx> {
                 .supported_types(self.arch, true)
                 .iter()
                 .map(|(ty, _)| ty.size())
+                .filter_map(InlineAsmSize::fixed_size_bytes)
                 .max()
-                .unwrap();
-            let align = rustc_abi::Align::from_bytes(reg_size.bytes()).unwrap();
+                .expect("expected fixed-size type");
+            let align = rustc_abi::Align::from_bytes(reg_size).unwrap();
             let offset = slot_size.align_to(align);
-            *slot_size = offset + reg_size;
+            *slot_size = offset + rustc_abi::Size::from_bytes(reg_size);
             offset
         };
         let mut new_slot = |x| new_slot_fn(&mut slot_size, x);

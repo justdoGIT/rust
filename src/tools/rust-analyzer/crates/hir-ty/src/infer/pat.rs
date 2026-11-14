@@ -530,9 +530,6 @@ impl<'db> InferenceContext<'db> {
                 self.infer_slice_pat(pat, before, slice, after, expected, pat_info)
             }
             Pat::Expr(expr) => self.infer_destructuring_assignment_expr(expr, expected),
-            Pat::ConstBlock(expr) => {
-                self.infer_expr(expr, &Expectation::has_type(expected), ExprIsRead::Yes)
-            }
         }
     }
 
@@ -634,9 +631,8 @@ impl<'db> InferenceContext<'db> {
             // All other literals result in non-reference types.
             // As a result, we allow `if let 0 = &&0 {}` but not `if let "foo" = &&"foo" {}` unless
             // `deref_patterns` is enabled.
-            &Pat::Lit(expr) | &Pat::ConstBlock(expr) => {
+            &Pat::Lit(expr) => {
                 let lit_ty = self.infer_expr_pat_unadjusted(expr);
-                // Call `resolve_vars_if_possible` here for inline const blocks.
                 let lit_ty = self.infcx().resolve_vars_if_possible(lit_ty);
                 // If `deref_patterns` is enabled, allow `if let "foo" = &&"foo" {}`.
                 if self.features.deref_patterns {
@@ -872,7 +868,7 @@ impl<'db> InferenceContext<'db> {
             expected,
         );
         if !(ty.is_numeric() || ty.is_char() || ty.references_error()) {
-            // FIXME: Emit an error.
+            self.push_diagnostic(InferenceDiagnostic::InvalidRangePatType { pat });
             return self.types.types.error;
         }
         ty
@@ -1015,7 +1011,7 @@ impl<'db> InferenceContext<'db> {
             | ValueNs::ImplSelf(_)
             | ValueNs::LocalBinding(_)
             | ValueNs::StaticId(_) => {
-                // FIXME: Emit an error.
+                self.push_diagnostic(InferenceDiagnostic::InvalidPatPathRes { pat, res });
                 return Err(());
             }
             ValueNs::ConstId(_) | ValueNs::EnumVariantId(_) | ValueNs::StructId(_) => {} // OK
@@ -1124,7 +1120,7 @@ impl<'db> InferenceContext<'db> {
         let element_tys_iter = (0..max_len).map(|i| {
             self.table.next_ty_var(elements.get(i).copied().map(Span::PatId).unwrap_or(Span::Dummy))
         });
-        let element_tys = Tys::new_from_iter(interner, element_tys_iter);
+        let element_tys = Tys::new_from_iter(element_tys_iter);
         let pat_ty = Ty::new(interner, TyKind::Tuple(element_tys));
         if self.demand_eqtype(pat.into(), expected, pat_ty).is_err() {
             let expected = if let TyKind::Tuple(tys) =
@@ -1387,7 +1383,9 @@ impl<'db> InferenceContext<'db> {
                         // (RFC 3627, Rule 5). If we implement a pattern typing ruleset with Rule 4E
                         // but not Rule 5, we'll need to check that here.
                         debug_assert!(ref_pat_matches_mut_ref);
-                        // FIXME: Emit an error.
+                        self.push_diagnostic(
+                            InferenceDiagnostic::MatchInheritedImmRefWithMutRefPat { pat },
+                        );
                     }
 
                     pat_info.binding_mode = ByRef::No;
@@ -1425,7 +1423,9 @@ impl<'db> InferenceContext<'db> {
                             // falling back to the inherited reference didn't work. This should be
                             // the same error as the old-Edition version below.
                             debug_assert!(ref_pat_matches_mut_ref);
-                            // FIXME: Emit an error.
+                            self.push_diagnostic(
+                                InferenceDiagnostic::MatchInheritedImmRefWithMutRefPat { pat },
+                            );
                         }
 
                         pat_info.binding_mode = ByRef::No;
@@ -1462,7 +1462,9 @@ impl<'db> InferenceContext<'db> {
                         // inherited reference.
                         if pat_mutbl > inh_mut {
                             // We can't match a lone inherited shared reference with `&mut`.
-                            // FIXME: Emit an error.
+                            self.push_diagnostic(
+                                InferenceDiagnostic::MatchInheritedImmRefWithMutRefPat { pat },
+                            );
                         }
 
                         self.result.skipped_ref_pats.insert(pat);

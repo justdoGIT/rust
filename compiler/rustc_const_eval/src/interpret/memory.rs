@@ -14,9 +14,9 @@ use std::{assert_matches, fmt, ptr};
 use rustc_abi::{Align, HasDataLayout, Size};
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
-use rustc_middle::bug;
 use rustc_middle::mir::display_allocation;
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
+use rustc_span::bug;
 use tracing::{debug, instrument, trace};
 
 use super::{
@@ -740,13 +740,6 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         }
     }
 
-    /// Gives raw, immutable access to the `Allocation` address, without bounds or alignment checks.
-    /// The caller is responsible for calling the access hooks!
-    pub fn get_alloc_bytes_unchecked_raw(&self, id: AllocId) -> InterpResult<'tcx, *const u8> {
-        let alloc = self.get_alloc_raw(id)?;
-        interp_ok(alloc.get_bytes_unchecked_raw())
-    }
-
     /// Bounds-checked *but not align-checked* allocation access.
     pub fn get_ptr_alloc<'a>(
         &'a self,
@@ -838,16 +831,6 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         interp_ok((alloc, &mut self.machine))
     }
 
-    /// Gives raw, mutable access to the `Allocation` address, without bounds or alignment checks.
-    /// The caller is responsible for calling the access hooks!
-    pub fn get_alloc_bytes_unchecked_raw_mut(
-        &mut self,
-        id: AllocId,
-    ) -> InterpResult<'tcx, *mut u8> {
-        let alloc = self.get_alloc_raw_mut(id)?.0;
-        interp_ok(alloc.get_bytes_unchecked_raw_mut())
-    }
-
     /// Bounds-checked *but not align-checked* allocation access.
     pub fn get_ptr_alloc_mut<'a>(
         &'a mut self,
@@ -910,6 +893,12 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             // We check `tcx` last as that has to acquire a lock in `many-seeds` mode.
             // This also matches the order in `get_alloc_info`.
             || self.tcx.try_get_global_alloc(id).is_some()
+    }
+
+    /// Check whether an allocation contains provenance.
+    pub fn has_provenance_in_alloc(&self, id: AllocId) -> InterpResult<'tcx, bool> {
+        let alloc = self.get_alloc_raw(id)?;
+        interp_ok(!alloc.provenance().range_empty(alloc_range(Size::ZERO, alloc.size()), &self.tcx))
     }
 
     /// Obtain the size and alignment of an allocation, even if that allocation has
@@ -1558,6 +1547,21 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         let dest_bytes =
             dest_alloc.get_bytes_unchecked_for_overwrite_ptr(&tcx, dest_range).as_mut_ptr();
 
+        // Enforce `nonoverlapping`.
+        if src_alloc_id == dest_alloc_id {
+            if nonoverlapping {
+                // `Size` additions
+                if (src_offset <= dest_offset && src_offset + size > dest_offset)
+                    || (dest_offset <= src_offset && dest_offset + num_copies * size > src_offset)
+                {
+                    throw_ub_format!("`copy_nonoverlapping` called on overlapping ranges");
+                }
+            }
+        }
+        if num_copies > 1 {
+            assert!(nonoverlapping, "multi-copy only supported in non-overlapping mode");
+        }
+
         if init.no_bytes_init() {
             // Fast path: If all bytes are `uninit` then there is nothing to copy. The target range
             // is marked as uninitialized but we otherwise omit changing the byte representation which may
@@ -1567,6 +1571,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             // operating system this can avoid physically allocating the page.
             dest_alloc.write_uninit(&tcx, dest_range);
             // `write_uninit` also resets the provenance, so we are done.
+            // IMPORTANT: there are no more UB checks below that we would skip here.
             return interp_ok(());
         }
 
@@ -1574,22 +1579,8 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         // behind `src` and `dest`. Also, we use the overlapping-safe `ptr::copy` if `src` and
         // `dest` could possibly overlap.
         // The pointers above remain valid even if the `HashMap` table is moved around because they
-        // point into the `Vec` storing the bytes.
+        // point into the `Box` storing the bytes.
         unsafe {
-            if src_alloc_id == dest_alloc_id {
-                if nonoverlapping {
-                    // `Size` additions
-                    if (src_offset <= dest_offset && src_offset + size > dest_offset)
-                        || (dest_offset <= src_offset && dest_offset + size > src_offset)
-                    {
-                        throw_ub_format!("`copy_nonoverlapping` called on overlapping ranges");
-                    }
-                }
-            }
-            if num_copies > 1 {
-                assert!(nonoverlapping, "multi-copy only supported in non-overlapping mode");
-            }
-
             let size_in_bytes = size.bytes_usize();
             // For particularly large arrays (where this is perf-sensitive) it's common that
             // we're writing a single byte repeatedly. So, optimize that case to a memset.
@@ -1599,10 +1590,11 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 let value = *src_bytes;
                 dest_bytes.write_bytes(value, (size * num_copies).bytes_usize());
             } else if src_alloc_id == dest_alloc_id {
+                // Copy within a single allocation, assume they may overlap.
                 let mut dest_ptr = dest_bytes;
                 for _ in 0..num_copies {
                     // Here we rely on `src` and `dest` being non-overlapping if there is more than
-                    // one copy.
+                    // one copy (otherwise, the 1st copy would clobber the src for the 2nd copy).
                     ptr::copy(src_bytes, dest_ptr, size_in_bytes);
                     dest_ptr = dest_ptr.add(size_in_bytes);
                 }

@@ -676,7 +676,7 @@ impl DepGraphData {
             let ok = match color {
                 DepNodeColor::Unknown => true,
                 DepNodeColor::Red => false,
-                DepNodeColor::Green(..) => sess.opts.jobs.frontend.is_some(), // Other threads may mark this green
+                DepNodeColor::Green(..) => sess.opts.jobs.frontend.is_parallel(), // Other threads may mark this green
             };
             if !ok {
                 panic!("{}", msg())
@@ -859,12 +859,6 @@ impl DepGraph {
     /// so, return the path that leads to it. Used to skip doing work.
     pub fn previous_work_product(&self, v: &WorkProductId) -> Option<WorkProduct> {
         self.data.as_ref().and_then(|data| data.previous_work_products.get(v).cloned())
-    }
-
-    /// Access the map of work-products created during the cached run. Only
-    /// used during saving of the dep-graph.
-    pub fn previous_work_products(&self) -> &WorkProductMap {
-        &self.data.as_ref().unwrap().previous_work_products
     }
 
     pub fn debug_was_loaded_from_disk(&self, dep_node: DepNode) -> bool {
@@ -1141,6 +1135,13 @@ pub struct WorkProduct {
     /// By convention, file extensions are currently used as identifiers, i.e. the key "o" maps to
     /// the object file's path, and "dwo" to the dwarf object file's path.
     pub saved_files: UnordMap<String, String>,
+}
+
+impl WorkProduct {
+    /// The metadata work product is not produced by any CGU and thus its
+    /// name cannot be derived from `CodegenUnit`. Both the writers and readers
+    /// of the metadata work product use this constant to agree on the name.
+    pub const METADATA_WORKPRODUCT_CGU_NAME: &str = "metadata";
 }
 
 pub type WorkProductMap = UnordMap<WorkProductId, WorkProduct>;

@@ -867,7 +867,7 @@ pub enum Abi {
     CCmseNonSecureEntry,
     System { unwind: bool },
     RustCall,
-    Unadjusted,
+    LlvmIntrinsic,
     RustCold,
     RiscvInterruptM,
     RiscvInterruptS,
@@ -1374,9 +1374,15 @@ pub enum AssocTypeData {
     Rpitit(ImplTraitInTraitData),
 }
 
+#[derive(Clone, PartialEq, Debug, Eq, Serialize)]
+pub enum AssocConstData {
+    Named(Symbol),
+    Anonymous,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum AssocKind {
-    Const { name: Symbol },
+    Const { data: AssocConstData },
     Fn { name: Symbol, has_self: bool },
     Type { data: AssocTypeData },
 }

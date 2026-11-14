@@ -1,7 +1,7 @@
 //! Term search
 
 use hir_def::type_ref::Mutability;
-use hir_ty::db::HirDatabase;
+use hir_ide::db::HirDatabase;
 use itertools::Itertools;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -113,8 +113,8 @@ impl<'db> LookupTable<'db> {
     fn find(&mut self, db: &'db dyn HirDatabase, ty: &Type<'db>) -> Option<Vec<Expr<'db>>> {
         let res = self
             .data
-            .iter()
-            .find(|(t, _)| t.could_unify_with_deeply(db, ty))
+            .get_key_value(ty)
+            .or_else(|| self.data.iter().find(|(t, _)| t.could_unify_with_deeply(db, ty)))
             .map(|(t, tts)| tts.exprs(t));
 
         if res.is_none() {
@@ -138,8 +138,8 @@ impl<'db> LookupTable<'db> {
     fn find_autoref(&mut self, db: &'db dyn HirDatabase, ty: &Type<'db>) -> Option<Vec<Expr<'db>>> {
         let res = self
             .data
-            .iter()
-            .find(|(t, _)| t.could_unify_with_deeply(db, ty))
+            .get_key_value(ty)
+            .or_else(|| self.data.iter().find(|(t, _)| t.could_unify_with_deeply(db, ty)))
             .map(|(t, it)| it.exprs(t))
             .or_else(|| {
                 self.data
@@ -175,6 +175,7 @@ impl<'db> LookupTable<'db> {
     /// transitive. For example `Vec<i32>` and `FxHashSet<i32>` both unify with `Iterator<Item = i32>`,
     /// but they clearly do not unify themselves.
     fn insert(&mut self, ty: Type<'db>, exprs: impl Iterator<Item = Expr<'db>>) {
+        let ty = ty.instantiate_with_errors();
         match self.data.get_mut(&ty) {
             Some(it) => {
                 it.extend_with_threshold(self.many_threshold, exprs);

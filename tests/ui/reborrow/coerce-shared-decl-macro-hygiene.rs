@@ -1,3 +1,7 @@
+//! Test that Reborrow and CoerceShared can be derived in macros.
+//! This should eventually pass.
+
+
 #![feature(reborrow, decl_macro)]
 #![allow(incomplete_features)]
 
@@ -17,7 +21,7 @@ macro my_macro($field:ident) {
 
     impl Reborrow for MyMut<'_> {}
 
-    impl<'a> CoerceShared<MyRef<'a>> for MyMut<'a> {}
+    impl<'a: 'b, 'b> CoerceShared<MyRef<'b>> for MyMut<'a> {}
     //~^ ERROR
 }
 

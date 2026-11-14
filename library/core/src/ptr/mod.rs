@@ -159,10 +159,10 @@
 //!
 //! Allocations typically have a fixed size that cannot change. However, allocations created by
 //! directly invoking page table operations of the operating system, e.g. via `mmap`, are allowed to
-//! grow by adding more pages to them at the end. Unmapping parts of an allocation (i.e., shrinking
-//! it or punching holes into it) is currently not supported. Allocations created via
-//! "compiler-recognized" operations, such as `std::alloc` methods or `libc::malloc`, can never
-//! change their size, even if they use `mmap` under the hood.
+//! grow by adding more pages to them at the end. Adding more pages before the beginning, or
+//! unmapping parts of an allocation (i.e., shrinking it or punching holes into it), is currently
+//! not supported. Allocations created via "compiler-recognized" operations, such as `std::alloc`
+//! methods or `libc::malloc`, can never change their size, even if they use `mmap` under the hood.
 //!
 //! [`null()`]: null
 //!
@@ -434,11 +434,6 @@ use crate::num::NonZero;
 use crate::ops::FnPtr;
 use crate::{fmt, hash, intrinsics, ub_checks};
 
-#[unstable(feature = "ptr_alignment_type", issue = "102070")]
-#[deprecated(since = "1.96.0", note = "moved from `ptr` to `mem`")]
-/// Deprecated re-export of [mem::Alignment].
-pub type Alignment = mem::Alignment;
-
 mod metadata;
 #[unstable(feature = "ptr_metadata", issue = "81513")]
 pub use metadata::{DynMetadata, Pointee, Thin, from_raw_parts, from_raw_parts_mut, metadata};
@@ -446,10 +441,6 @@ pub use metadata::{DynMetadata, Pointee, Thin, from_raw_parts, from_raw_parts_mu
 mod non_null;
 #[stable(feature = "nonnull", since = "1.25.0")]
 pub use non_null::NonNull;
-
-mod unique;
-#[unstable(feature = "ptr_internals", issue = "none")]
-pub use unique::Unique;
 
 mod const_ptr;
 mod mut_ptr;
@@ -1120,7 +1111,7 @@ pub const fn with_exposed_provenance_mut<T>(addr: usize) -> *mut T {
 #[must_use]
 #[stable(feature = "ptr_from_ref", since = "1.76.0")]
 #[rustc_const_stable(feature = "ptr_from_ref", since = "1.76.0")]
-#[rustc_never_returns_null_ptr]
+#[lint::never_returns_null_ptr]
 #[rustc_diagnostic_item = "ptr_from_ref"]
 pub const fn from_ref<T: PointeeSized>(r: &T) -> *const T {
     r
@@ -1171,7 +1162,7 @@ pub const fn from_ref<T: PointeeSized>(r: &T) -> *const T {
 #[must_use]
 #[stable(feature = "ptr_from_ref", since = "1.76.0")]
 #[rustc_const_stable(feature = "ptr_from_ref", since = "1.76.0")]
-#[rustc_never_returns_null_ptr]
+#[lint::never_returns_null_ptr]
 pub const fn from_mut<T: PointeeSized>(r: &mut T) -> *mut T {
     r
 }
@@ -1620,6 +1611,8 @@ pub const unsafe fn replace<T>(dst: *mut T, src: T) -> T {
 ///
 /// Note that even if `T` has size `0`, the pointer must be properly aligned.
 ///
+/// Care must be taken around [ownership of the returned value](#ownership-of-the-returned-value).
+///
 /// # Examples
 ///
 /// Basic usage:
@@ -2065,12 +2058,13 @@ pub const unsafe fn write_unaligned<T>(dst: *mut T, src: T) {
 /// are two cases of usage that need to be distinguished:
 ///
 /// - When a volatile operation is used for memory inside an [allocation], it behaves exactly like
-///   [`read`], except for the additional guarantee that it won't be elided or reordered (see
-///   above). This implies that the operation will actually access memory and not e.g. be lowered to
-///   reusing data from a previous read. Other than that, all the usual rules for memory accesses
-///   apply (including provenance).  In particular, just like in C, whether an operation is volatile
-///   has no bearing whatsoever on questions involving concurrent accesses from multiple threads.
-///   Volatile accesses behave exactly like non-atomic accesses in that regard.
+///   [`read`], except for the additional guarantee that it won't be elided or reordered across
+///   other externally observable events (see above). This implies that the operation will actually
+///   access memory and not e.g. be lowered to reusing data from a previous read. Other than that,
+///   all the usual rules for memory accesses apply (including provenance). In particular, just
+///   like in C, whether an operation is volatile has no bearing whatsoever on questions involving
+///   concurrent accesses from multiple threads. Volatile accesses behave exactly like non-atomic
+///   accesses in that regard.
 ///
 /// - Volatile operations, however, may also be used to access memory that is _outside_ of any Rust
 ///   allocation. In this use-case, the pointer does *not* have to be [valid] for reads. This is
@@ -2079,10 +2073,10 @@ pub const unsafe fn write_unaligned<T>(dst: *mut T, src: T) {
 ///   semantics associated to their manipulation, and cannot be used as general purpose memory.
 ///   Here, any address value is possible, including 0 and [`usize::MAX`], so long as the semantics
 ///   of such a read are well-defined by the target hardware. The provenance of the pointer is
-///   irrelevant, and it can be created with [`without_provenance`]. The access must not trap. It
-///   can cause side-effects, but those must not affect Rust-allocated memory in any way. This
-///   access is still not considered [atomic], and as such it cannot be used for inter-thread
-///   synchronization.
+///   irrelevant, and it can be created with [`without_provenance`]. The access is allowed to trap,
+///   which must immediately abort the process. It can also cause other side-effects, but those
+///   must not affect Rust-allocated memory in any way. This access is still not considered
+///   [atomic], and as such it cannot be used for inter-thread synchronization.
 ///
 /// Note that volatile memory operations where T is a zero-sized type are noops and may be ignored.
 ///
@@ -2117,9 +2111,8 @@ pub const unsafe fn write_unaligned<T>(dst: *mut T, src: T) {
 /// Behavior is undefined if any of the following conditions are violated:
 ///
 /// * `src` must be either [valid] for reads, or `T` must be a ZST, or `src` must point to memory
-///   outside of all Rust allocations and reading from that memory must:
-///   - not trap, and
-///   - not cause any memory inside a Rust allocation to be modified.
+///   outside of all Rust allocations and reading from that memory must not cause any memory inside
+///   a Rust allocation to be modified.
 ///
 /// * `src` must be properly aligned.
 ///
@@ -2172,11 +2165,12 @@ pub const unsafe fn read_volatile<T>(src: *const T) -> T {
 ///
 /// - When a volatile operation is used for memory inside an [allocation], it behaves exactly like
 ///   [`write`][write()], except for the additional guarantee that it won't be elided or reordered
-///   (see above). This implies that the operation will actually access memory and not e.g. be
-///   lowered to a register access. Other than that, all the usual rules for memory accesses apply
-///   (including provenance). In particular, just like in C, whether an operation is volatile has no
-///   bearing whatsoever on questions involving concurrent access from multiple threads. Volatile
-///   accesses behave exactly like non-atomic accesses in that regard.
+///   across other externally observable events (see above). This implies that the operation will
+///   actually access memory and not e.g. be lowered to a register access. Other than that, all the
+///   usual rules for memory accesses apply (including provenance). In particular, just like in C,
+///   whether an operation is volatile has no bearing whatsoever on questions involving concurrent
+///   access from multiple threads. Volatile accesses behave exactly like non-atomic accesses in
+///   that regard.
 ///
 /// - Volatile operations, however, may also be used to access memory that is _outside_ of any Rust
 ///   allocation. In this use-case, the pointer does *not* have to be [valid] for writes. This is
@@ -2185,10 +2179,10 @@ pub const unsafe fn read_volatile<T>(src: *const T) -> T {
 ///   semantics associated to their manipulation, and cannot be used as general purpose memory.
 ///   Here, any address value is possible, including 0 and [`usize::MAX`], so long as the semantics
 ///   of such a write are well-defined by the target hardware. The provenance of the pointer is
-///   irrelevant, and it can be created with [`without_provenance`]. The access must not trap. It
-///   can cause side-effects, but those must not affect Rust-allocated memory in any way. This
-///   access is still not considered [atomic], and as such it cannot be used for inter-thread
-///   synchronization.
+///   irrelevant, and it can be created with [`without_provenance_mut`]. The access is allowed to
+///   trap, which must immediately abort the process. It can also cause other side-effects, but
+///   those must not affect Rust-allocated memory in any way. This access is still not considered
+///   [atomic], and as such it cannot be used for inter-thread synchronization.
 ///
 /// Note that volatile memory operations on zero-sized types (e.g., if a zero-sized type is passed
 /// to `write_volatile`) are noops and may be ignored.
@@ -2224,9 +2218,8 @@ pub const unsafe fn read_volatile<T>(src: *const T) -> T {
 /// Behavior is undefined if any of the following conditions are violated:
 ///
 /// * `dst` must be either [valid] for writes, or `T` must be a ZST, or `dst` must point to memory
-///   outside of all Rust allocations and writing to that memory must:
-///   - not trap, and
-///   - not cause any memory inside a Rust allocation to be modified.
+///   outside of all Rust allocations and writing to that memory must not cause any memory inside a
+///   Rust allocation to be modified.
 ///
 /// * `dst` must be properly aligned.
 ///
@@ -2538,20 +2531,33 @@ pub fn addr_eq<T: PointeeSized, U: PointeeSized>(p: *const T, q: *const U) -> bo
 /// This is the same as `f == g`, but using this function makes clear that the potentially
 /// surprising semantics of function pointer comparison are involved.
 ///
-/// There are **very few guarantees** about how functions are compiled and they have no intrinsic
+/// There are **basically no guarantees** about how functions are compiled as they have no intrinsic
 /// “identity”; in particular, this comparison:
 ///
-/// * May return `true` unexpectedly, in cases where functions are equivalent.
+/// * May return `true` unexpectedly, even in cases where functions are not logically equivalent,
+///   as long as they compile to the same machine code.
 ///
 ///   For example, the following program is likely (but not guaranteed) to print `(true, true)`
 ///   when compiled with optimization:
 ///
 ///   ```
+///   use std::hint::assert_unchecked;
+///
 ///   let f: fn(i32) -> i32 = |x| x;
-///   let g: fn(i32) -> i32 = |x| x + 0;  // different closure, different body
-///   let h: fn(u32) -> u32 = |x| x + 0;  // different signature too
-///   dbg!(std::ptr::fn_addr_eq(f, g), std::ptr::fn_addr_eq(f, h)); // not guaranteed to be equal
+///   let g: fn(u32) -> u32 = |x| x + 0;  // different type, different body
+///   let h: unsafe fn(i32) -> i32 = |x| unsafe { assert_unchecked(x != 0); x };  // different unsafe preconditions
+///   // These three functions are allowed but not guaranteed to compare equal.
+///   dbg!(std::ptr::fn_addr_eq(f, g), std::ptr::fn_addr_eq(f, h));
 ///   ```
+///
+///   In other words, functions that compare equal can have different behavior! Even if
+///   `fn_addr_eq(f, h)` is true, it is still undefined behavior to call `h(0)`, while `f(0)` is
+///   safe to call.
+///
+///   The explanation for this is that function pointers have [provenance][crate::ptr#provenance].
+///   If functions have the same assembly and get merged, their provenance decides which variant of
+///   the function will be called. `f` and `h` therefore end up with the same address but different
+///   provenance, and `fn_addr_eq` only compares the address.
 ///
 /// * May return `false` in any case.
 ///
@@ -2559,26 +2565,12 @@ pub fn addr_eq<T: PointeeSized, U: PointeeSized>(p: *const T, q: *const U) -> bo
 ///   (From an implementation perspective, this is possible because functions may sometimes be
 ///   processed more than once by the compiler, resulting in duplicate machine code.)
 ///
-/// Despite these false positives and false negatives, this comparison can still be useful.
-/// Specifically, if
-///
-/// * `T` is the same type as `U`, `T` is a [subtype] of `U`, or `U` is a [subtype] of `T`, and
-/// * `ptr::fn_addr_eq(f, g)` returns true,
-///
-/// then calling `f` and calling `g` will be equivalent.
-///
-///
-/// # Examples
-///
-/// ```
-/// use std::ptr;
-///
-/// fn a() { println!("a"); }
-/// fn b() { println!("b"); }
-/// assert!(!ptr::fn_addr_eq(a as fn(), b as fn()));
-/// ```
-///
-/// [subtype]: https://doc.rust-lang.org/reference/subtyping.html
+/// These limitations imply that comparing function pointers (via this function or via `==`) is only
+/// useful in extremely niche circumstances. For instance, if a library maintains a set of
+/// callbacks, and doesn't guarantee which of them are actually called (i.e., callbacks can be
+/// spuriously skipped), then it can be legitimate to deduplicate callbacks based on `fn_addr_eq`.
+/// This can never introduce undefined behavior because it only skips executing some of the
+/// registered callbacks.
 #[stable(feature = "ptr_fn_addr_eq", since = "1.85.0")]
 #[inline(always)]
 #[must_use = "function pointer comparison produces a value"]

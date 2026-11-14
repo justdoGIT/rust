@@ -2,6 +2,10 @@
 //!
 //! This module implements the command-line parsing of the build system which
 //! has various flags to configure how it's run.
+#![expect(
+    clippy::large_unopt_stack_frames,
+    reason = "the clap::Subcommand derive on `Subcommand` triggers this lint"
+)]
 
 use std::path::{Path, PathBuf};
 
@@ -738,6 +742,11 @@ impl Subcommand {
             Subcommand::Test { rerun, .. } => *rerun,
             _ => false,
         }
+    }
+
+    /// Are we executing a `check --all-targets` command?
+    pub(crate) fn check_all_targets(&self) -> bool {
+        matches!(self, Subcommand::Check { all_targets: true, .. })
     }
 }
 

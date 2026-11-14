@@ -1,3 +1,5 @@
+//! Test that CoerceShared can be implemented even if field order changes.
+
 #![feature(reborrow)]
 #![allow(dead_code)]
 
@@ -16,7 +18,7 @@ struct ReorderRef<'a> {
     a: &'a u8,
 }
 
-impl<'a> CoerceShared<ReorderRef<'a>> for ReorderMut<'a> {}
+impl<'a: 'b, 'b> CoerceShared<ReorderRef<'b>> for ReorderMut<'a> {}
 //~^ ERROR
 
 fn read(value: ReorderRef<'_>) -> (u16, u8) {

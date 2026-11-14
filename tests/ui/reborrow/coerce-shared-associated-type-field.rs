@@ -1,3 +1,6 @@
+//! Test that CoerceShared can resolve field type equivalence through GATs.
+//! This should eventually pass.
+
 #![feature(reborrow)]
 #![allow(dead_code)]
 
@@ -24,7 +27,7 @@ struct MyRef<'a> {
 
 impl Reborrow for MyMut<'_> {}
 
-impl<'a> CoerceShared<MyRef<'a>> for MyMut<'a> {}
+impl<'a: 'b, 'b> CoerceShared<MyRef<'b>> for MyMut<'a> {}
 //~^ ERROR
 
 fn main() {}

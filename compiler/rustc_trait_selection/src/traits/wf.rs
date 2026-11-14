@@ -5,17 +5,18 @@
 
 use std::iter;
 
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_hir as hir;
-use rustc_hir::attrs::lang_items::LangItem;
-use rustc_infer::traits::{ObligationCauseCode, PredicateObligation, PredicateObligations};
-use rustc_middle::bug;
+use rustc_infer::traits::{
+    ObligationCauseCode, PredicateObligation, PredicateObligations, WellFormedLoc,
+};
 use rustc_middle::ty::{
-    self, DelayedSet, GenericArgsRef, Term, TermKind, Ty, TyCtxt, TypeSuperVisitable,
+    self, DelayedSet, GenericArgs, PredicateProxy, Term, TermKind, Ty, TyCtxt, TypeSuperVisitable,
     TypeVisitable, TypeVisitableExt, TypeVisitor,
 };
 use rustc_session::diagnostics::feature_err;
 use rustc_span::def_id::{DefId, LocalDefId};
-use rustc_span::{Span, sym};
+use rustc_span::{Span, bug, sym};
 use tracing::{debug, instrument};
 
 use crate::infer::InferCtxt;
@@ -98,7 +99,7 @@ pub fn unnormalized_obligations<'tcx>(
     span: Span,
     body_def_id: LocalDefId,
 ) -> Option<PredicateObligations<'tcx>> {
-    debug_assert_eq!(term, infcx.resolve_vars_if_possible(term));
+    debug_assert_eq!(term, infcx.deeply_resolve_ignoring_regions(term));
 
     // However, if `term` IS an unresolved inference variable, returns `None`,
     // because we are not able to make any progress at all. This is to prevent
@@ -186,6 +187,13 @@ pub fn clause_obligations<'tcx>(
             wf.add_wf_preds_for_term(ty.into());
         }
         ty::ClauseKind::Projection(t) => {
+            if !t.projection_term.kind.is_type() {
+                assert!(matches!(
+                    t.projection_term.kind,
+                    ty::AliasTermKind::ProjectionConst { .. }
+                ));
+                wf.require_const_item_ty(t.projection_term.expect_ct());
+            }
             wf.add_wf_preds_for_projection_term(t.projection_term);
             wf.add_wf_preds_for_term(t.term);
         }
@@ -273,7 +281,7 @@ enum Elaborate {
 ///
 /// Note that bounds that can be expressed as associated item bounds are **not**
 /// super predicates. This means that form 2 and 3 from above are only relevant if
-/// the [`GenericArgsRef`] of the projection type are not its identity arguments.
+/// the [`GenericArgs`] of the projection type are not its identity arguments.
 fn extend_cause_with_original_assoc_item_obligation<'tcx>(
     tcx: TyCtxt<'tcx>,
     item: Option<&hir::Item<'tcx>>,
@@ -353,7 +361,7 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
             return self.out;
         }
 
-        let cause = self.cause(ObligationCauseCode::WellFormed(None));
+        let cause = self.cause(ObligationCauseCode::WellFormed(WellFormedLoc::None));
         let param_env = self.param_env;
         let mut obligations = PredicateObligations::with_capacity(self.out.len());
         for mut obligation in self.out {
@@ -504,14 +512,23 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
         // (*) The predicates of an inherent associated type include the
         //     predicates of the impl that it's contained in.
 
-        if !data.self_ty().has_escaping_bound_vars() {
+        // In an ideal world, there are no escaping bound vars here. However, WF is jank, and
+        // sometimes there are. We can only `compute_inherent_assoc_term_args` if the Self ty in the
+        // args has no escaping bound vars. If we already have impl format args, though,
+        // `compute_inherent_assoc_term_args` is a no-op (and we have no Self type), so no need to
+        // check for escaping bound vars.
+        let can_compute_impl_args =
+            matches!(data.kind, ty::AliasTermKind::InherentConstImpl { .. })
+                || !data.self_ty().has_escaping_bound_vars();
+
+        if can_compute_impl_args {
             // FIXME(inherent_associated_types): Should this happen inside of a snapshot?
             // FIXME(inherent_associated_types): This is incompatible with the new solver and lazy norm!
             let args = traits::project::compute_inherent_assoc_term_args(
                 &mut traits::SelectionContext::new(self.infcx),
                 self.param_env,
                 data,
-                self.cause(ObligationCauseCode::WellFormed(None)),
+                self.cause(ObligationCauseCode::WellFormed(WellFormedLoc::None)),
                 self.recursion_depth,
                 &mut self.out,
             );
@@ -522,9 +539,9 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
         data.args.visit_with(self);
     }
 
-    fn add_wf_preds_for_projection_args(&mut self, args: GenericArgsRef<'tcx>) {
+    fn add_wf_preds_for_projection_args(&mut self, args: GenericArgs<'tcx>) {
         let tcx = self.tcx();
-        let cause = self.cause(ObligationCauseCode::WellFormed(None));
+        let cause = self.cause(ObligationCauseCode::WellFormed(WellFormedLoc::None));
         let param_env = self.param_env;
         let depth = self.recursion_depth;
 
@@ -562,6 +579,33 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
         }
     }
 
+    fn require_const_item_ty(&mut self, ct: ty::AliasConst<'tcx>) {
+        let ty = ct.type_of(self.tcx()).skip_norm_wip();
+
+        if ct.kind.is_direct_const(self.tcx()) {
+            // This is already checked in `wfcheck::check_const_item`.
+            return;
+        }
+
+        if self.tcx().features().const_param_ty_unchecked() || ty.has_escaping_bound_vars() {
+            return;
+        }
+
+        let cause = self.cause(ObligationCauseCode::ConstItemTy(ty));
+        let trait_ref = ty::TraitRef::new(
+            self.tcx(),
+            self.tcx().require_lang_item(LangItem::ConstParamTy, cause.span),
+            [ty],
+        );
+        self.out.push(traits::Obligation::with_depth(
+            self.tcx(),
+            cause,
+            self.recursion_depth,
+            self.param_env,
+            ty::Binder::dummy(trait_ref),
+        ));
+    }
+
     /// Pushes all the predicates needed to validate that `term` is WF into `out`.
     #[instrument(level = "debug", skip(self))]
     fn add_wf_preds_for_term(&mut self, term: Term<'tcx>) {
@@ -573,7 +617,7 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
     fn nominal_obligations(
         &mut self,
         def_id: DefId,
-        args: GenericArgsRef<'tcx>,
+        args: GenericArgs<'tcx>,
         mut push_obligation: impl FnMut(&mut Self, PredicateObligation<'tcx>),
     ) {
         // PERF: `Sized`'s predicates include `MetaSized`, but both are compiler implemented marker
@@ -768,7 +812,7 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                 self.require_sized(subty, ObligationCauseCode::SliceOrArrayElem);
                 // Note that the len being WF is implicitly checked while visiting.
                 // Here we just check that it's of type usize.
-                let cause = self.cause(ObligationCauseCode::ArrayLen(t));
+                let cause = self.cause(ObligationCauseCode::ArrayLen(t, self.span));
                 self.out.push(traits::Obligation::with_depth(
                     tcx,
                     cause,
@@ -968,7 +1012,7 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                     let principal_def_id = principal.skip_binder().def_id;
                     self.out.push(traits::Obligation::with_depth(
                         tcx,
-                        self.cause(ObligationCauseCode::WellFormed(None)),
+                        self.cause(ObligationCauseCode::WellFormed(WellFormedLoc::None)),
                         self.recursion_depth,
                         self.param_env,
                         ty::Binder::dummy(ty::PredicateKind::DynCompatible(principal_def_id)),
@@ -994,7 +1038,10 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                         let kind = obligation.predicate.kind().skip_binder();
                         let keep = match kind {
                             ty::PredicateKind::Clause(ty::ClauseKind::ConstArgHasType(ct, _))
-                                if matches!(ct.kind(), ty::ConstKind::Param(..)) =>
+                                if matches!(
+                                    ct.kind(),
+                                    ty::ConstKind::Param(..) | ty::ConstKind::Placeholder(..)
+                                ) =>
                             {
                                 // ConstArgHasType clauses are not higher kinded. Assert as
                                 // such so we can fix this up if that ever changes.
@@ -1015,8 +1062,16 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
 
                 if !t.has_escaping_bound_vars() {
                     for projection in data.projection_bounds() {
+                        let projection = projection.with_self_ty(tcx, t);
+                        let projection_pred = projection.skip_binder();
+                        if matches!(
+                            projection_pred.projection_term.kind,
+                            ty::AliasTermKind::ProjectionConst { .. }
+                        ) {
+                            self.require_const_item_ty(projection_pred.projection_term.expect_ct());
+                        }
+
                         let pred_binder = projection
-                            .with_self_ty(tcx, t)
                             .map_bound(|p| {
                                 p.term.as_const().map(|ct| {
                                     let assoc_const_ty = tcx
@@ -1033,7 +1088,7 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                         if let Some(pred_binder) = pred_binder {
                             self.out.push(traits::Obligation::with_depth(
                                 tcx,
-                                self.cause(ObligationCauseCode::WellFormed(None)),
+                                self.cause(ObligationCauseCode::WellFormed(WellFormedLoc::None)),
                                 self.recursion_depth,
                                 self.param_env,
                                 pred_binder,
@@ -1056,7 +1111,7 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
             // See also the comment on `fn obligations`, describing cycle
             // prevention, which happens before this can be reached.
             ty::Infer(_) => {
-                let cause = self.cause(ObligationCauseCode::WellFormed(None));
+                let cause = self.cause(ObligationCauseCode::WellFormed(WellFormedLoc::None));
                 self.out.push(traits::Obligation::with_depth(
                     tcx,
                     cause,
@@ -1066,6 +1121,15 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                         t.into(),
                     ))),
                 ));
+            }
+
+            ty::View(def, args, _fields) => {
+                // FIXME(scrabsha): what should we require from fields?
+
+                // WfNominalType
+                self.nominal_obligations(def.did(), args, |this, obligation| {
+                    this.out.push(obligation)
+                });
             }
         }
 
@@ -1079,12 +1143,12 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
             ty::ConstKind::Alias(_, alias_const) => {
                 if !c.has_escaping_bound_vars() {
                     // Skip type consts as mGCA doesn't support evaluatable clauses
-                    if !alias_const.kind.is_type_const(tcx) && !tcx.features().generic_const_args()
-                    {
+                    if !alias_const.kind.is_direct_const(tcx) && !tcx.features().gca_const_items() {
                         let predicate = ty::Binder::dummy(ty::PredicateKind::Clause(
                             ty::ClauseKind::ConstEvaluatable(c),
                         ));
-                        let cause = self.cause(ObligationCauseCode::WellFormed(None));
+                        let cause =
+                            self.cause(ObligationCauseCode::WellFormed(WellFormedLoc::None));
                         self.out.push(traits::Obligation::with_depth(
                             tcx,
                             cause,
@@ -1095,9 +1159,15 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                     }
 
                     match alias_const.kind {
-                        ty::AliasConstKind::Inherent { .. } => {
+                        ty::AliasConstKind::InherentSelf { .. } => {
                             self.add_wf_preds_for_inherent_projection(alias_const.into());
                             return; // Subtree is handled by above function
+                        }
+                        // FIXME: This should be unreachable but isn't because we normalize in item
+                        // wfck before computing wf requirements
+                        ty::AliasConstKind::InherentImpl { .. } => {
+                            self.add_wf_preds_for_inherent_projection(alias_const.into());
+                            return;
                         }
                         ty::AliasConstKind::Projection { def_id }
                         | ty::AliasConstKind::Free { def_id }
@@ -1112,7 +1182,7 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                 }
             }
             ty::ConstKind::Infer(_) => {
-                let cause = self.cause(ObligationCauseCode::WellFormed(None));
+                let cause = self.cause(ObligationCauseCode::WellFormed(WellFormedLoc::None));
 
                 self.out.push(traits::Obligation::with_depth(
                     tcx,
@@ -1135,7 +1205,7 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                 let predicate = ty::Binder::dummy(ty::PredicateKind::Clause(
                     ty::ClauseKind::ConstEvaluatable(c),
                 ));
-                let cause = self.cause(ObligationCauseCode::WellFormed(None));
+                let cause = self.cause(ObligationCauseCode::WellFormed(WellFormedLoc::None));
                 self.out.push(traits::Obligation::with_depth(
                     tcx,
                     cause,
@@ -1153,12 +1223,13 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
             }
             ty::ConstKind::Value(val) => {
                 // FIXME(mgca): no need to feature-gate once valtree lifetimes are not erased
-                if tcx.features().min_generic_const_args() {
+                if tcx.features().gca() {
                     match val.ty.kind() {
                         ty::Adt(adt_def, args) => {
                             let adt_val = val.destructure_adt_const();
                             let variant_def = adt_def.variant(adt_val.variant);
-                            let cause = self.cause(ObligationCauseCode::WellFormed(None));
+                            let cause =
+                                self.cause(ObligationCauseCode::WellFormed(WellFormedLoc::None));
                             self.out.extend(variant_def.fields.iter().zip(adt_val.fields).map(
                                 |(field_def, &field_val)| {
                                     let field_ty = tcx
@@ -1180,7 +1251,8 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                         }
                         ty::Tuple(field_tys) => {
                             let field_vals = val.to_branch();
-                            let cause = self.cause(ObligationCauseCode::WellFormed(None));
+                            let cause =
+                                self.cause(ObligationCauseCode::WellFormed(WellFormedLoc::None));
                             self.out.extend(field_tys.iter().zip(field_vals).map(
                                 |(field_ty, &field_val)| {
                                     let predicate = ty::PredicateKind::Clause(
@@ -1198,7 +1270,8 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                         }
                         ty::Array(elem_ty, _len) => {
                             let elem_vals = val.to_branch();
-                            let cause = self.cause(ObligationCauseCode::WellFormed(None));
+                            let cause =
+                                self.cause(ObligationCauseCode::WellFormed(WellFormedLoc::None));
 
                             self.out.extend(elem_vals.iter().map(|&elem_val| {
                                 let predicate = ty::PredicateKind::Clause(
@@ -1224,7 +1297,7 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
         c.super_visit_with(self)
     }
 
-    fn visit_predicate(&mut self, _p: ty::Predicate<'tcx>) -> Self::Result {
+    fn visit_predicate<P: PredicateProxy<TyCtxt<'tcx>>>(&mut self, _p: P) -> Self::Result {
         bug!("predicate should not be checked for well-formedness");
     }
 }

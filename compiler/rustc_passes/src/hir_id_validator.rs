@@ -59,7 +59,7 @@ impl<'a, 'hir> HirIdValidator<'a, 'hir> {
             .max()
             .expect("owning item has no entry");
 
-        if max != self.hir_ids_seen.len() - 1 {
+        if max != self.hir_ids_seen.count() - 1 {
             let pretty_owner = self.tcx.hir_def_path(owner.def_id).to_string_no_crate_verbose();
 
             let missing_items: Vec<_> = (0..=max as u32)
@@ -83,7 +83,7 @@ impl<'a, 'hir> HirIdValidator<'a, 'hir> {
         }
     }
 
-    fn check_nested_id(&mut self, id: LocalDefId) {
+    fn check_nested_id(&self, id: LocalDefId) {
         let Some(owner) = self.owner else { return };
         let def_parent = self.tcx.local_parent(id);
         let def_parent_hir_id = self.tcx.local_def_id_to_hir_id(def_parent);

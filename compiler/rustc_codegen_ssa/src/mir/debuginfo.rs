@@ -9,9 +9,9 @@ use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
 use rustc_middle::ty::{Instance, Ty};
-use rustc_middle::{bug, mir, ty};
+use rustc_middle::{mir, ty};
 use rustc_session::config::DebugInfo;
-use rustc_span::{BytePos, DUMMY_SP, Span, Symbol, hygiene, sym};
+use rustc_span::{BytePos, DUMMY_SP, Span, Symbol, bug, hygiene, sym};
 
 use super::operand::{OperandRef, OperandValue};
 use super::place::{PlaceRef, PlaceValue};
@@ -300,8 +300,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     fn debug_poison_to_local(&self, bx: &mut Bx, local: mir::Local) {
         let ty = self.monomorphize(self.mir.local_decls[local].ty);
         let layout = bx.cx().layout_of(ty);
-        let to_backend_ty = bx.cx().immediate_backend_type(layout);
-        let place_ref = PlaceRef::new_sized(bx.cx().const_poison(to_backend_ty), layout);
+        let place_ref = PlaceRef::new_sized(bx.cx().const_poison(bx.cx().type_ptr()), layout);
         self.debug_new_val_to_local(bx, local, place_ref, &[]);
     }
 

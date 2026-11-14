@@ -5,6 +5,7 @@ mod tests;
 
 use core::clone::CloneToUninit;
 
+use crate::alloc::Allocator;
 use crate::borrow::{Borrow, Cow};
 use crate::collections::TryReserveError;
 use crate::hash::{Hash, Hasher};
@@ -568,8 +569,8 @@ impl OsString {
 
     /// Truncate the `OsString` to the specified length.
     ///
-    /// If `new_len` is greater than the string's current length, this has no
-    /// effect.
+    /// If `new_len` is greater than or equal to the string's current length,
+    /// this has no effect.
     ///
     /// # Panics
     ///
@@ -578,11 +579,12 @@ impl OsString {
     #[inline]
     #[unstable(feature = "os_string_truncate", issue = "133262")]
     pub fn truncate(&mut self, len: usize) {
-        if len <= self.len() {
-            self.as_os_str().inner.check_public_boundary(len);
-            // SAFETY: The length was just checked to be at a valid boundary.
-            unsafe { self.inner.truncate_unchecked(len) };
+        if len >= self.len() {
+            return;
         }
+        self.as_os_str().inner.check_public_boundary(len);
+        // SAFETY: The length was just checked to be at a valid boundary.
+        unsafe { self.inner.truncate_unchecked(len) };
     }
 
     /// Provides plumbing to `Vec::extend_from_slice` without giving full
@@ -1094,7 +1096,13 @@ impl OsStr {
     ///
     /// Any caller must ensure `mid` is within bounds and lies on
     /// a valid `OsStr` boundary for the platform.
-    unsafe fn split_at_unchecked(&self, mid: usize) -> (&OsStr, &OsStr) {
+    #[unstable(feature = "str_split_at_unchecked", issue = "165545")]
+    pub unsafe fn split_at_unchecked(&self, mid: usize) -> (&OsStr, &OsStr) {
+        debug_assert!(
+            self.inner.try_check_public_boundary(mid).is_some(),
+            "OsStr::split_at_unchecked requires the index to be on a valid `OsStr` boundary",
+        );
+
         // SAFETY: it's up to the caller to ensure this is safe.
         unsafe {
             let (first, second) = self.as_encoded_bytes().split_at_unchecked(mid);
@@ -1395,10 +1403,10 @@ impl From<OsString> for Box<OsStr> {
 }
 
 #[stable(feature = "more_box_slice_clone", since = "1.29.0")]
-impl Clone for Box<OsStr> {
+impl<A: Allocator + Clone> Clone for Box<OsStr, A> {
     #[inline]
     fn clone(&self) -> Self {
-        self.to_os_string().into_boxed_os_str()
+        Box::clone_from_ref_in(&**self, Self::allocator(self).clone())
     }
 }
 
@@ -1710,7 +1718,7 @@ impl fmt::Display for Display<'_> {
     }
 }
 
-#[unstable(feature = "slice_concat_ext", issue = "27747")]
+#[unstable(feature = "slice_concat_ext", issue = "none", reason = "implementation detail")]
 impl<S: Borrow<OsStr>> alloc::slice::Join<&OsStr> for [S] {
     type Output = OsString;
 
@@ -1804,10 +1812,10 @@ impl AsInner<Slice> for OsStr {
 
 #[stable(feature = "osstring_from_str", since = "1.45.0")]
 impl FromStr for OsString {
-    type Err = core::convert::Infallible;
+    type Err = !;
 
     #[inline]
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_str(s: &str) -> Result<Self, !> {
         Ok(OsString::from(s))
     }
 }
@@ -1815,7 +1823,7 @@ impl FromStr for OsString {
 #[stable(feature = "osstring_extend", since = "1.52.0")]
 impl Extend<OsString> for OsString {
     #[inline]
-    fn extend<T: IntoIterator<Item = OsString>>(&mut self, iter: T) {
+    fn extend<I: IntoIterator<Item = OsString>>(&mut self, iter: I) {
         for s in iter {
             self.push(&s);
         }
@@ -1825,7 +1833,7 @@ impl Extend<OsString> for OsString {
 #[stable(feature = "osstring_extend", since = "1.52.0")]
 impl<'a> Extend<&'a OsStr> for OsString {
     #[inline]
-    fn extend<T: IntoIterator<Item = &'a OsStr>>(&mut self, iter: T) {
+    fn extend<I: IntoIterator<Item = &'a OsStr>>(&mut self, iter: I) {
         for s in iter {
             self.push(s);
         }
@@ -1835,7 +1843,7 @@ impl<'a> Extend<&'a OsStr> for OsString {
 #[stable(feature = "osstring_extend", since = "1.52.0")]
 impl<'a> Extend<Cow<'a, OsStr>> for OsString {
     #[inline]
-    fn extend<T: IntoIterator<Item = Cow<'a, OsStr>>>(&mut self, iter: T) {
+    fn extend<I: IntoIterator<Item = Cow<'a, OsStr>>>(&mut self, iter: I) {
         for s in iter {
             self.push(&s);
         }

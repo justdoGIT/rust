@@ -7,7 +7,6 @@
 use std::borrow::Cow;
 use std::fmt::{self, Write};
 use std::hash::Hash;
-use std::mem;
 use std::num::NonZero;
 
 use either::{Left, Right};
@@ -17,16 +16,16 @@ use rustc_abi::{
     WrappingRange,
 };
 use rustc_ast::Mutability;
+use rustc_attr_ir::LangItem;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir as hir;
-use rustc_middle::bug;
 use rustc_middle::mir::interpret::{
     InterpErrorKind, InvalidMetaKind, Misalignment, PointerArithmetic, Provenance, alloc_range,
     interp_ok,
 };
 use rustc_middle::ty::layout::{LayoutCx, TyAndLayout};
 use rustc_middle::ty::{self, Ty};
-use rustc_span::{Symbol, sym};
+use rustc_span::{Symbol, bug, sym};
 use tracing::trace;
 
 use super::machine::AllocMap;
@@ -597,7 +596,7 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValidityVisitor<'rt, 'tcx, M> {
             // for the purpose of validity, consider foreign types to have
             // alignment and size determined by the layout (size will be 0,
             // alignment should take attributes into account).
-            .unwrap_or_else(|| (place.layout.size, place.layout.align.abi));
+            .unwrap_or_else(|| (place.layout.size, place.layout.align));
 
         // If we're not allow to dangle, make sure this is dereferenceable and retag it for
         // the aliasing model.
@@ -657,9 +656,10 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValidityVisitor<'rt, 'tcx, M> {
                 // Try to compute the end address. Cannot use `Size` addition as that also applies
                 // the "max obj size" bound.
                 let addr = Size::from_bytes(addr.to_target_usize(*self.ecx.tcx)).bytes();
-                if addr
+                // addr + size must fit into usize, i.e., `sum <= usize::MAX`.
+                if !addr
                     .checked_add(size.bytes())
-                    .is_none_or(|result| result >= self.ecx.target_usize_max())
+                    .is_some_and(|result| result <= self.ecx.target_usize_max())
                 {
                     throw_validation_failure!(
                         self.path,
@@ -903,6 +903,17 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValidityVisitor<'rt, 'tcx, M> {
                 }
                 interp_ok(true)
             }
+            ty::Adt(adt_def, _)
+                if self.ecx.tcx.is_lang_item(adt_def.did(), LangItem::X87F80Raw) =>
+            {
+                // The x87_f80_raw lang item is effectively a primitive.
+                self.read_scalar(value, ExpectedKind::Float)?;
+                if self.reset_provenance_and_padding {
+                    self.ecx.clear_provenance(value)?;
+                    self.add_data_range_place(value);
+                }
+                interp_ok(true)
+            }
             ty::RawPtr(pointee, ..) => {
                 let ptr = self.read_immediate(value, ExpectedKind::RawPtr)?;
                 if self.reset_provenance_and_padding {
@@ -995,6 +1006,9 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValidityVisitor<'rt, 'tcx, M> {
             | ty::Param(..)
             | ty::Alias(..)
             | ty::CoroutineWitness(..) => bug!("Encountered invalid type {:?}", ty),
+
+            // FIXME(scrabsha)
+            ty::View(..) => unimplemented!(),
         }
     }
 
@@ -1121,7 +1135,7 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValidityVisitor<'rt, 'tcx, M> {
         let (size, _align) = self
             .ecx
             .size_and_align_of_val(&mplace)?
-            .unwrap_or((mplace.layout.size, mplace.layout.align.abi));
+            .unwrap_or((mplace.layout.size, mplace.layout.align));
         // If there is no padding at all, we can skip the rest: check for
         // a single data range covering the entire value.
         if data_bytes.0 == &[(start_offset, size)] {
@@ -1528,15 +1542,10 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValueVisitor<'tcx, M> for ValidityVisitor<'rt,
                     BackendRepr::Memory { .. } => unreachable!()
                 }
             }
-            ty::Adt(adt, _) if adt.is_maybe_dangling() => {
-                let old_may_dangle = mem::replace(&mut self.may_dangle, true);
-
-                let inner = self.ecx.project_field(val, FieldIdx::ZERO)?;
-                self.visit_value(&inner)?;
-
-                self.may_dangle = old_may_dangle;
-            }
             _ => {
+                let old_may_dangle = self.may_dangle;
+                self.may_dangle |= val.layout.ty.is_like_maybe_dangling();
+
                 // default handler
                 try_validation!(
                     self.walk_value(val),
@@ -1546,6 +1555,8 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValueVisitor<'tcx, M> for ValidityVisitor<'rt,
                     Ub(InvalidVTableTrait { vtable_dyn_type, expected_dyn_type }) =>
                         InvalidMetaWrongTrait { expected_dyn_type, vtable_dyn_type },
                 );
+
+                self.may_dangle = old_may_dangle;
             }
         }
 

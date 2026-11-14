@@ -208,12 +208,12 @@
 use std::cell::OnceCell;
 use std::ops::ControlFlow;
 
+use rustc_attr_ir::InlineAttr;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::sync::{Lock, par_for_each_in};
 use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_hir as hir;
-use rustc_hir::attrs::InlineAttr;
-use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, DefIdMap, LocalDefId};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
@@ -229,9 +229,8 @@ use rustc_middle::ty::{
     TypeFoldable, TypeVisitable, TypeVisitableExt, TypeVisitor, Unnormalized, VtblEntry,
 };
 use rustc_middle::util::Providers;
-use rustc_middle::{bug, span_bug};
 use rustc_session::config::{DebugInfo, EntryFnType, Offload};
-use rustc_span::{DUMMY_SP, Span, Spanned, Symbol, dummy_spanned, respan};
+use rustc_span::{DUMMY_SP, Span, Spanned, Symbol, bug, dummy_spanned, respan, span_bug};
 use rustc_structures::Limit;
 use tracing::{debug, instrument, trace};
 
@@ -345,6 +344,8 @@ impl<'tcx> Extend<Spanned<MonoItem<'tcx>>> for MonoItems<'tcx> {
     where
         I: IntoIterator<Item = Spanned<MonoItem<'tcx>>>,
     {
+        let iter = iter.into_iter();
+        self.items.reserve(iter.size_hint().0);
         for item in iter {
             self.push(item)
         }
@@ -1064,7 +1065,7 @@ fn visit_instance_use<'tcx>(
         | ty::InstanceKind::Shim(ty::ShimKind::ConstructCoroutineInClosure { .. })
         | ty::InstanceKind::Shim(ty::ShimKind::FnPtr(..))
         | ty::InstanceKind::Shim(ty::ShimKind::Clone(..))
-        | ty::InstanceKind::Shim(ty::ShimKind::FnPtrAsPtr(..))
+        | ty::InstanceKind::Shim(ty::ShimKind::FnAddrAsPtr(..))
         | ty::InstanceKind::Shim(ty::ShimKind::FnPtrFromPtr(..)) => {
             output.push(create_fn_mono_item(tcx, instance, source));
         }
@@ -1653,7 +1654,7 @@ impl<'v> RootCollector<'_, 'v> {
                 debug!("RootCollector: ItemKind::Static({})", self.tcx.def_path_str(def_id));
                 self.output.push(dummy_spanned(MonoItem::Static(def_id)));
             }
-            DefKind::Const { .. } => {
+            DefKind::Const => {
                 // Const items only generate mono items if they are actually used somewhere.
                 // Just declaring them is insufficient.
 
@@ -1661,14 +1662,6 @@ impl<'v> RootCollector<'_, 'v> {
                 // Otherwise the value is only collected when explicitly mentioned in other items.
                 if self.strategy == MonoItemCollectionStrategy::Eager {
                     let def_id = id.owner_id.to_def_id();
-                    // Type Consts don't have bodies to evaluate
-                    // nor do they make sense as a static.
-                    if self.tcx.is_type_const(def_id) {
-                        // FIXME(mgca): Is this actually what we want? We may want to
-                        // normalize to a ValTree then convert to a const allocation and
-                        // collect that?
-                        return;
-                    }
                     if self.tcx.generics_of(id.owner_id).own_requires_monomorphization() {
                         return;
                     }
@@ -1932,7 +1925,7 @@ pub(crate) fn collect_crate_mono_items<'tcx>(
     let recursion_limit = tcx.recursion_limit();
 
     tcx.sess.time("monomorphization_collector_graph_walk", || {
-        par_for_each_in(roots, |root| {
+        par_for_each_in(&roots[..], |root| {
             collect_items_root(tcx, dummy_spanned(*root), &state, recursion_limit);
         });
     });

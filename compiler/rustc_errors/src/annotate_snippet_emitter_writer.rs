@@ -5,7 +5,6 @@
 //!
 //! [annotate_snippets]: https://docs.rs/crate/annotate-snippets/
 
-use std::borrow::Cow;
 use std::fmt::Debug;
 use std::io;
 use std::io::Write;
@@ -29,7 +28,7 @@ use crate::emitter::{
 use crate::formatting::{format_diag_message, format_diag_messages};
 use crate::{
     CodeSuggestion, DiagInner, DiagMessage, Emitter, ErrCode, Level, MultiSpan, Style, Subdiag,
-    SuggestionStyle, TerminalUrl,
+    Sublevel, SuggestionStyle, TerminalUrl,
 };
 
 /// Generates diagnostics using annotate-snippet
@@ -46,6 +45,7 @@ pub struct AnnotateSnippetEmitter {
     track_diagnostics: bool,
     terminal_url: TerminalUrl,
     theme: OutputTheme,
+    no_graphics: bool,
 }
 
 impl Debug for AnnotateSnippetEmitter {
@@ -61,6 +61,7 @@ impl Debug for AnnotateSnippetEmitter {
             track_diagnostics,
             terminal_url,
             theme,
+            no_graphics,
         } = self;
 
         f.debug_struct("AnnotateSnippetEmitter")
@@ -74,6 +75,7 @@ impl Debug for AnnotateSnippetEmitter {
             .field("track_diagnostics", track_diagnostics)
             .field("terminal_url", terminal_url)
             .field("theme", theme)
+            .field("no_graphics", no_graphics)
             .finish()
     }
 }
@@ -125,12 +127,19 @@ fn annotation_level_for_level(level: Level) -> annotate_snippets::level::Level<'
             annotate_snippets::Level::ERROR.with_name("error: internal compiler error")
         }
         Level::Fatal | Level::Error => annotate_snippets::level::ERROR,
-        Level::ForceWarning | Level::Warning => annotate_snippets::Level::WARNING,
-        Level::Note | Level::OnceNote => annotate_snippets::Level::NOTE,
-        Level::Help | Level::OnceHelp => annotate_snippets::Level::HELP,
+        Level::Warning(_) => annotate_snippets::Level::WARNING,
+        Level::Note => annotate_snippets::Level::NOTE,
+        Level::Help => annotate_snippets::Level::HELP,
         Level::FailureNote => annotate_snippets::Level::NOTE.no_name(),
-        Level::Allow => panic!("Should not call with Allow"),
-        Level::Expect => panic!("Should not call with Expect"),
+    }
+}
+
+fn annotation_level_for_sublevel(level: Sublevel) -> annotate_snippets::level::Level<'static> {
+    match level {
+        Sublevel::Error => annotate_snippets::Level::ERROR,
+        Sublevel::Warning => annotate_snippets::Level::WARNING,
+        Sublevel::Note | Sublevel::OnceNote => annotate_snippets::Level::NOTE,
+        Sublevel::Help | Sublevel::OnceHelp => annotate_snippets::Level::HELP,
     }
 }
 
@@ -147,6 +156,7 @@ impl AnnotateSnippetEmitter {
             track_diagnostics: false,
             terminal_url: TerminalUrl::No,
             theme: OutputTheme::Ascii,
+            no_graphics: false,
         }
     }
 
@@ -166,9 +176,7 @@ impl AnnotateSnippetEmitter {
         // If at least one portion of the message is styled, we need to
         // "pre-style" the message
         let mut title = if msgs.iter().any(|(_, style)| style != &crate::Style::NoStyle) {
-            annotation_level
-                .clone()
-                .secondary_title(Cow::Owned(self.pre_style_msgs(msgs, *level, args)))
+            annotation_level.clone().secondary_title(self.pre_style_msgs(msgs, args))
         } else {
             annotation_level.clone().primary_title(format_diag_messages(msgs, args))
         };
@@ -186,8 +194,8 @@ impl AnnotateSnippetEmitter {
         // If we don't have span information, emit and exit
         let Some(sm) = self.sm.as_ref() else {
             group = group.elements(children.iter().map(|c| {
-                let msg = format_diag_messages(&c.messages, args).to_string();
-                let level = annotation_level_for_level(c.level);
+                let msg = format_diag_messages(&c.messages, args);
+                let level = annotation_level_for_sublevel(c.level);
                 level.message(msg)
             }));
 
@@ -250,12 +258,12 @@ impl AnnotateSnippetEmitter {
         }
 
         for c in children {
-            let level = annotation_level_for_level(c.level);
+            let level = annotation_level_for_sublevel(c.level);
 
             // If at least one portion of the message is styled, we need to
             // "pre-style" the message
             let msg = if c.messages.iter().any(|(_, style)| style != &crate::Style::NoStyle) {
-                Cow::Owned(self.pre_style_msgs(&c.messages, c.level, args))
+                self.pre_style_msgs(&c.messages, args)
             } else {
                 format_diag_messages(&c.messages, args)
             };
@@ -309,10 +317,7 @@ impl AnnotateSnippetEmitter {
                     // do not display this suggestion, it is meant only for tools
                 }
                 SuggestionStyle::HideCodeAlways => {
-                    let msg = format_diag_messages(
-                        &[(suggestion.msg.to_owned(), Style::HeaderMsg)],
-                        args,
-                    );
+                    let msg = format_diag_message(&suggestion.msg, args).into_owned();
                     group = group.element(annotate_snippets::Level::HELP.message(msg));
                 }
                 SuggestionStyle::HideCodeInline
@@ -539,21 +544,17 @@ impl AnnotateSnippetEmitter {
             ColorChoice::Never => Renderer::plain(),
         }
         .term_width(width)
-        .anonymized_line_numbers(self.ui_testing)
+        .anonymized_snippet_line_numbers(self.ui_testing)
         .decor_style(decor_style)
         .short_message(self.short_message)
+        .no_graphics(self.no_graphics)
     }
 
-    fn pre_style_msgs(
-        &self,
-        msgs: &[(DiagMessage, Style)],
-        level: Level,
-        args: &DiagArgMap,
-    ) -> String {
+    fn pre_style_msgs(&self, msgs: &[(DiagMessage, Style)], args: &DiagArgMap) -> String {
         msgs.iter()
             .filter_map(|(m, style)| {
                 let text = format_diag_message(m, args);
-                let style = style.anstyle(level);
+                let style = style.anstyle();
                 if text.is_empty() { None } else { Some(format!("{style}{text}{style:#}")) }
             })
             .collect()
@@ -714,6 +715,18 @@ fn collect_annotations(
             } else {
                 output.push((file, vec![ann]));
             }
+        }
+    }
+
+    for span in msp.span_context() {
+        let file = sm.lookup_source_file(span.lo());
+        let ann = Annotation { kind: AnnotationKind::Visible, span: *span, label: None };
+        if let Some((_, annotations)) =
+            output.iter_mut().find(|(f, _)| f.stable_id == file.stable_id)
+        {
+            annotations.push(ann);
+        } else {
+            output.push((file, vec![ann]));
         }
     }
 

@@ -1,7 +1,7 @@
 [relabel]
 allow-unauthenticated = [
-    "A-*", "C-*", "E-*", "I-*", "L-*", "P-*", "S-*", "T-*",
-    "good first issue", "beta-nominated"
+    "A-*", "C-*", "D-*", "E-*", "I-*", "L-*", "P-*", "S-*", "T-*",
+    "good first issue", "beta-nominated", "llm-assisted"
 ]
 
 # Allows shortcuts like `@rustbot ready`
@@ -26,6 +26,11 @@ cc = ["@notriddle"]
 [no-merges]
 exclude_titles = ["Rustup"] # exclude syncs from rust-lang/rust
 labels = ["has-merge-commits", "S-waiting-on-author"]
+
+[large-pull-requests]
+threshold = 500 # Pull requests over 500 changed lines should really be split up.
+exclude-files = ["tests"] # We don't want to penalize adding tests
+exclude-titles = ["Rustup"] # These are usually subtree syncs
 
 [review-requested]
 # Those labels are removed when PR author requests a review from an assignee
@@ -92,13 +97,12 @@ message_on_close = "PR rust-clippy#{number} has been closed. Thanks for particip
 message_on_reopen = "PR rust-clippy#{number} has been reopened."
 
 [assign]
-contributing_url = "https://github.com/rust-lang/rust-clippy/blob/master/CONTRIBUTING.md"
+contributing_url = "https://github.com/rust-lang/rust-clippy/blob/HEAD/CONTRIBUTING.md"
 users_on_vacation = [
     "matthiaskrgr",
     "Alexendoo",
     "y21",
     "ada4a",
-    "samueltardieu"
 ]
 
 [assign.owners]

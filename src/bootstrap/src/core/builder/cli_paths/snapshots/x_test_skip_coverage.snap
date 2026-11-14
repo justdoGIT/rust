@@ -20,6 +20,9 @@ expression: test --skip=coverage
 [Test] test::CodegenUnits
     targets: [aarch64-unknown-linux-gnu]
     - Suite(tests/codegen-units)
+[Test] test::AssemblyGcc
+    targets: [aarch64-unknown-linux-gnu]
+    - Suite(tests/assembly-gcc)
 [Test] test::AssemblyLlvm
     targets: [aarch64-unknown-linux-gnu]
     - Suite(tests/assembly-llvm)
@@ -90,6 +93,7 @@ expression: test --skip=coverage
     - Set({compiler/rustc_error_messages})
     - Set({compiler/rustc_errors})
     - Set({compiler/rustc_expand})
+    - Set({compiler/rustc_expand_queries})
     - Set({compiler/rustc_feature})
     - Set({compiler/rustc_fs_util})
     - Set({compiler/rustc_graphviz})
@@ -183,6 +187,9 @@ expression: test --skip=coverage
 [Test] test::StdarchVerify
     targets: [x86_64-unknown-linux-gnu]
     - Set({library/stdarch/crates/stdarch-verify})
+[Test] test::StdarchGenCheck
+    targets: [x86_64-unknown-linux-gnu]
+    - Set({stdarch-gen-check})
 [Test] test::RustdocJSStd
     targets: [x86_64-unknown-linux-gnu]
     - Suite(tests/rustdoc-js-std)
@@ -205,8 +212,11 @@ expression: test --skip=coverage
     targets: [x86_64-unknown-linux-gnu]
     - Set({src/tools/rust-installer})
 [Test] test::TestFloatParse
-    targets: [x86_64-unknown-linux-gnu]
+    targets: [aarch64-unknown-linux-gnu]
     - Set({src/tools/test-float-parse})
+[Test] test::CompilerBuiltins
+    targets: [aarch64-unknown-linux-gnu]
+    - Set({compiler-builtins})
 [Test] test::RunMake
     targets: [aarch64-unknown-linux-gnu]
     - Suite(tests/run-make)

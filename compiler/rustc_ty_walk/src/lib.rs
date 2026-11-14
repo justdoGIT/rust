@@ -7,9 +7,8 @@
 
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
-use rustc_middle::span_bug;
 use rustc_middle::ty::{self, TyCtxt, TypeVisitable, Unnormalized, VisitorResult, try_visit};
-use rustc_span::Span;
+use rustc_span::{Span, span_bug};
 use tracing::{instrument, trace};
 
 pub trait SpannedTypeVisitor<'tcx> {
@@ -67,8 +66,8 @@ pub fn walk_types<'tcx, V: SpannedTypeVisitor<'tcx>>(
         DefKind::TyAlias { .. }
         | DefKind::AssocTy
         | DefKind::Static { .. }
-        | DefKind::Const { .. }
-        | DefKind::AssocConst { .. } => return visit_alias(),
+        | DefKind::Const
+        | DefKind::AssocConst => return visit_alias(),
         DefKind::AnonConst
             if tcx.anon_const_kind(item) != ty::AnonConstKind::NonTypeSystemInline =>
         {
@@ -97,7 +96,7 @@ pub fn walk_types<'tcx, V: SpannedTypeVisitor<'tcx>>(
             };
             for field in def.all_fields() {
                 let span = tcx.def_ident_span(field.did).unwrap();
-                let ty = field.ty(tcx, args);
+                let ty = field.ty(tcx, *args);
                 try_visit!(visitor.visit(span, ty));
             }
             for (clause, span) in tcx.explicit_clauses_of(item).instantiate_identity(tcx) {
@@ -115,8 +114,8 @@ pub fn walk_types<'tcx, V: SpannedTypeVisitor<'tcx>>(
                     .trait_ref
                     .path
                     .span;
-                let args =
-                    &tcx.impl_trait_ref(item).instantiate_identity().skip_norm_wip().args[1..];
+                let args = tcx.impl_trait_ref(item).instantiate_identity().skip_norm_wip().args;
+                let args = &args.as_slice()[1..];
                 try_visit!(visitor.visit(span, args));
             }
             let span = match tcx.hir_node_by_def_id(item).ty() {

@@ -157,22 +157,10 @@ LINE_PATTERN = re.compile(
     re.X | re.UNICODE,
 )
 
-DEPRECATED_LINE_PATTERN = re.compile(
-    r"//\s+@",
-    re.X | re.UNICODE,
-)
-
 
 def get_commands(template):
     with io.open(template, encoding="utf-8") as f:
         for lineno, line in concat_multi_lines(f):
-            if DEPRECATED_LINE_PATTERN.search(line):
-                print_err(
-                    lineno,
-                    line,
-                    "Deprecated command syntax, replace `// @` with `//@ `",
-                )
-                continue
             m = LINE_PATTERN.search(line)
             if not m:
                 continue
@@ -624,8 +612,16 @@ def check_command(c, cache):
 
 def check(target, commands):
     cache = CachedFiles(target)
+    run_commands = 0
     for c in commands:
         check_command(c, cache)
+        run_commands += 1
+    if run_commands == 0 and os.environ.get("IS_RMAKE") is None:
+        stderr(
+            "\nNo check, move this file in `rustdoc-ui` testsuite if you want to check "
+            + "it doesn't crash"
+        )
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

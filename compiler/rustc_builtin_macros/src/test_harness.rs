@@ -8,7 +8,7 @@ use rustc_ast::attr::contains_name;
 use rustc_ast::entry::EntryPointType;
 use rustc_ast::mut_visit::*;
 use rustc_ast::visit::Visitor;
-use rustc_ast::{ModKind, attr};
+use rustc_ast::{GeneratedAttr, ModKind, attr};
 use rustc_attr_ir::AttributeKind;
 use rustc_attr_parsing::AttributeParser;
 use rustc_expand::base::{ExtCtxt, ResolverExpand};
@@ -38,6 +38,7 @@ struct TestCtxt<'a> {
     def_site: Span,
     test_cases: Vec<Test>,
     reexport_test_harness_main: Option<Symbol>,
+    /// Value of a `#[test_runner]` attribute, if present.
     test_runner: Option<ast::Path>,
 }
 
@@ -109,8 +110,7 @@ impl TestHarnessGenerator<'_> {
                 Some(node_id),
             );
             for test in &mut tests {
-                // See the comment on `mk_main` for why we're using
-                // `apply_mark` directly.
+                // See the comment on `add_main` for why we're using `apply_mark` directly.
                 test.ident.span =
                     test.ident.span.apply_mark(expn_id.to_expn_id(), Transparency::Opaque);
             }
@@ -126,7 +126,7 @@ impl<'a> MutVisitor for TestHarnessGenerator<'a> {
         self.add_test_cases(ast::CRATE_NODE_ID, c.spans.inner_span, prev_tests);
 
         // Create a main function to run our tests
-        c.items.push(mk_main(&mut self.cx));
+        add_main(&mut self.cx, c);
     }
 
     fn visit_item(&mut self, item: &mut ast::Item) {
@@ -266,7 +266,7 @@ fn generate_test_harness(
 /// #[rustc_main]
 /// pub fn main() {
 ///     extern crate test;
-///     test::test_main_static(&[
+///     test::test_main_env_args(&[
 ///         &test_const1,
 ///         &test_const2,
 ///         &test_const3,
@@ -286,18 +286,22 @@ fn generate_test_harness(
 ///
 /// [`TestCtxt::reexport_test_harness_main`] provides a different name for the `main`
 /// function and [`TestCtxt::test_runner`] provides a path that replaces
-/// `test::test_main_static`.
-fn mk_main(cx: &mut TestCtxt<'_>) -> Box<ast::Item> {
+/// `test::test_main_env_args`.
+fn add_main(cx: &mut TestCtxt<'_>, c: &mut ast::Crate) {
     let sp = cx.def_site;
     let ecx = &cx.ext_cx;
+    // `sp` has def-site hygiene so should not clash with user-defined names.
     let test_ident = Ident::new(sym::test, sp);
 
-    let runner_name =
-        if cx.panic_strategy.unwinds() { "test_main_static" } else { "test_main_static_abort" };
-
-    // test::test_main_static(...)
+    // test::test_main_env_args(...)
     let mut test_runner = cx.test_runner.clone().unwrap_or_else(|| {
-        ecx.path(sp, vec![test_ident, Ident::from_str_and_span(runner_name, sp)])
+        // Built-in runner name depends on panic strategy.
+        let runner_name = if cx.panic_strategy.unwinds() {
+            "test_main_env_args"
+        } else {
+            "test_main_env_args_abort"
+        };
+        ecx.path(sp, &[test_ident, Ident::from_str_and_span(runner_name, sp)])
     });
 
     test_runner.span = sp;
@@ -307,48 +311,38 @@ fn mk_main(cx: &mut TestCtxt<'_>) -> Box<ast::Item> {
     let call_test_main = ecx.stmt_expr(call_test_main);
 
     // extern crate test
-    let test_extern_stmt = ecx.stmt_item(
-        sp,
-        ecx.item(sp, ast::AttrVec::new(), ast::ItemKind::ExternCrate(None, test_ident)),
-    );
+    let test_extern_stmt =
+        ecx.item(sp, ast::AttrVec::new(), ast::ItemKind::ExternCrate(None, test_ident));
 
     // #[rustc_main]
     let main_attr = ecx.attr_word(sym::rustc_main, sp);
     // #[coverage(off)]
-    let coverage_attr = ecx.attr_nested_word(sym::coverage, sym::off, sp);
+    let coverage_attr = ecx.generated_attr(sp, GeneratedAttr::CoverageOff);
     // #[doc(hidden)]
-    let doc_hidden_attr = ecx.attr_nested_word(sym::doc, sym::hidden, sp);
+    let doc_hidden_attr = ecx.generated_attr(sp, GeneratedAttr::DocHidden);
 
-    // pub fn main() { ... }
-    let main_ret_ty = ecx.ty(sp, ast::TyKind::Tup(ThinVec::new()));
-
-    // If no test runner is provided we need to import the test crate
-    let main_body = if cx.test_runner.is_none() {
-        ecx.block(sp, thin_vec![test_extern_stmt, call_test_main])
+    // pub fn main() -> ExitCode { ... }
+    let main_ret_ty = if cx.test_runner.is_none() {
+        // Built-in runner has return type `ExitCode`.
+        let exit_code_path = &[test_ident, Ident::new(sym::ExitCode, sp)];
+        ecx.ty_path(ecx.path(sp, exit_code_path))
     } else {
-        ecx.block(sp, thin_vec![call_test_main])
+        // User-defined runners have return type `()`.
+        ecx.ty_unit(sp)
     };
+
+    let main_body = ecx.block(sp, thin_vec![call_test_main]);
 
     let decl = ecx.fn_decl(ThinVec::new(), ast::FnRetTy::Ty(main_ret_ty));
     let sig = ast::FnSig { decl, header: ast::FnHeader::default(), span: sp };
-    let defaultness = ast::Defaultness::Implicit;
-
     // Honor the reexport_test_harness_main attribute
     let main_ident = match cx.reexport_test_harness_main {
         Some(sym) => Ident::new(sym, sp.with_ctxt(SyntaxContext::root())),
         None => Ident::new(sym::main, sp),
     };
 
-    let main = ast::ItemKind::Fn(Box::new(ast::Fn {
-        defaultness,
-        sig,
-        ident: main_ident,
-        generics: ast::Generics::default(),
-        contract: None,
-        body: Some(main_body),
-        define_opaque: None,
-        eii_impl: None,
-    }));
+    let main =
+        ast::ItemKind::Fn(ecx.item_fn(sig, main_ident, ast::Generics::default(), Some(main_body)));
 
     let main = Box::new(ast::Item {
         attrs: thin_vec![main_attr, coverage_attr, doc_hidden_attr],
@@ -360,8 +354,13 @@ fn mk_main(cx: &mut TestCtxt<'_>) -> Box<ast::Item> {
     });
 
     // Integrate the new item into existing module structures.
-    let main = AstFragment::Items(smallvec![main]);
-    cx.ext_cx.monotonic_expander().fully_expand_fragment(main).make_items().pop().unwrap()
+    // `extern crate test;` is only needed with the default runner.
+    let items = AstFragment::Items(if cx.test_runner.is_none() {
+        smallvec![test_extern_stmt, main]
+    } else {
+        smallvec![main]
+    });
+    c.items.extend(cx.ext_cx.monotonic_expander().fully_expand_fragment(items).make_items());
 }
 
 /// Creates a slice containing every test like so:
@@ -379,9 +378,7 @@ fn mk_tests_slice(cx: &TestCtxt<'_>, sp: Span) -> Box<ast::Expr> {
         sp,
         tests
             .iter()
-            .map(|test| {
-                ecx.expr_addr_of(test.span, ecx.expr_path(ecx.path(test.span, vec![test.ident])))
-            })
+            .map(|test| ecx.expr_ref(test.span, ecx.expr_path(ecx.path(test.span, &[test.ident]))))
             .collect(),
     )
 }

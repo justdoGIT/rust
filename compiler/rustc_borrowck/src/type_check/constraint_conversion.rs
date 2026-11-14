@@ -6,8 +6,7 @@ use rustc_infer::infer::outlives::env::RegionBoundPairs;
 use rustc_infer::infer::outlives::obligations::{TypeOutlives, TypeOutlivesDelegate};
 use rustc_infer::infer::region_constraints::{GenericKind, VerifyBound};
 use rustc_middle::ty::{
-    self, GenericArgKind, RegionExt, TyCtxt, TypeFoldable, TypeVisitableExt, elaborate,
-    fold_regions,
+    self, GenericArgKind, TyCtxt, TypeFoldable, TypeVisitableExt, elaborate, fold_regions,
 };
 use rustc_span::Span;
 use tracing::{debug, instrument};
@@ -87,7 +86,7 @@ impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
         &mut self,
         closure_requirements: &ClosureRegionRequirements<'tcx>,
         closure_def_id: LocalDefId,
-        closure_args: ty::GenericArgsRef<'tcx>,
+        closure_args: ty::GenericArgs<'tcx>,
     ) {
         // Extract the values of the free regions in `closure_args`
         // into a vector. These are the regions that we will be
@@ -158,7 +157,7 @@ impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
 
             GenericArgKind::Type(mut t1) => {
                 // Scraped constraints may have had inference vars.
-                t1 = self.infcx.resolve_vars_if_possible(t1);
+                t1 = self.infcx.deeply_resolve_ignoring_regions(t1);
 
                 let implicit_region_bound =
                     ty::Region::new_var(tcx, universal_regions.implicit_region_bound());

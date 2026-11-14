@@ -13,9 +13,8 @@ use rustc_middle::ty::layout::IntegerExt;
 use rustc_middle::ty::{
     self, FieldDef, OpaqueTypeKey, ScalarInt, Ty, TyCtxt, TypeVisitableExt, VariantDef,
 };
-use rustc_middle::{bug, span_bug};
 use rustc_span::def_id::LocalModId;
-use rustc_span::{DUMMY_SP, ErrorGuaranteed, Span};
+use rustc_span::{DUMMY_SP, ErrorGuaranteed, Span, bug, span_bug};
 
 use crate::constructor::Constructor::*;
 use crate::constructor::{
@@ -193,7 +192,7 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
     ) -> impl Iterator<Item = (&'tcx FieldDef, RevealedTy<'tcx>)> {
         let ty::Adt(_, args) = ty.kind() else { bug!() };
         variant.fields.iter().map(move |field| {
-            let ty = field.ty(self.tcx, args);
+            let ty = field.ty(self.tcx, *args);
             // `field.ty()` doesn't normalize after instantiating.
             let ty =
                 self.tcx.try_normalize_erasing_regions(self.typing_env, ty).unwrap_or_else(|e| {
@@ -380,8 +379,8 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
                         let variant_def_id = def.variant(idx).def_id;
                         // Visibly uninhabited variants.
                         let is_inhabited = v
-                            .inhabited_predicate(cx.tcx, *def)
-                            .instantiate(cx.tcx, args)
+                            .inhabited_predicate(cx.tcx)
+                            .instantiate(cx.tcx, *args)
                             .apply_revealing_opaque(cx.tcx, cx.typing_env, cx.module, &|key| {
                                 cx.reveal_opaque_key(key)
                             });
@@ -433,6 +432,9 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
             ty::CoroutineWitness(_, _) | ty::Bound(_, _) | ty::Placeholder(_) | ty::Infer(_) => {
                 bug!("Encountered unexpected type in `ConstructorSet::for_ty`: {ty:?}")
             }
+
+            // FIXME(scrabsha)
+            ty::View(..) => unimplemented!(),
         })
     }
 
@@ -930,6 +932,10 @@ impl<'p, 'tcx: 'p> PatCx for RustcPatCtxt<'p, 'tcx> {
 
     fn bug(&self, fmt: fmt::Arguments<'_>) -> Self::Error {
         span_bug!(self.scrut_span, "{}", fmt)
+    }
+
+    fn delayed_bug(&self, fmt: fmt::Arguments<'_>) -> Self::Error {
+        self.tcx.dcx().span_delayed_bug(self.scrut_span, format!("{fmt}"))
     }
 
     fn lint_overlapping_range_endpoints(

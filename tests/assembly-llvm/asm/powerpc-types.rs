@@ -101,6 +101,48 @@ pub extern "C" fn f64_to_f32(x: f64) -> f32 {
     res
 }
 
+// power9-LABEL: f64_to_f128:
+// power9: .cfi_startproc
+// power9-NEXT: xscpsgndp [[#INPUT:]], 1, 1
+// power9-NEXT: #APP
+// power9-NEXT: xscvdpqp 2, [[#INPUT - 32]]
+// power9-NEXT: #NO_APP
+// power9-NEXT: blr
+#[cfg(power9)]
+#[unsafe(no_mangle)]
+pub extern "C" fn f64_to_f128(x: f64) -> f128 {
+    let res;
+    unsafe {
+        asm!("xscvdpqp {}, {}", out(vreg) res, in(vreg) x, options(pure, nostack, nomem));
+    };
+    res
+}
+
+// FIXME(f16): This test will need to be updated if/when the `f16` ABI gets standardised.
+// (see https://github.com/llvm/llvm-project/pull/196559)
+// power9-LABEL: f64_to_f16:
+// power9: .cfi_startproc
+// powerpc_power9-NEXT: stwu 1, -[[#STACK:]](1)
+// powerpc_power9-NEXT: .cfi_def_cfa_offset [[#STACK]]
+// powerpc64le_power9-NEXT: li [[#INDEX:]], 8
+// power9-NEXT: #APP
+// power9-NEXT: xscvdphp [[#OUTPUT:]], 1
+// power9-NEXT: #NO_APP
+// power9be-NEXT: stxv [[#OUTPUT]], [[#%d,OFFSET:]](1)
+// power9be-NEXT: lhz 3, [[#OFFSET + 6]](1)
+// powerpc_power9-NEXT: addi 1, 1, [[#STACK]]
+// powerpc64le_power9-NEXT: vextuhrx 3, [[#INDEX]], [[#OUTPUT - 32]]
+// power9-NEXT: blr
+#[cfg(power9)]
+#[unsafe(no_mangle)]
+pub extern "C" fn f64_to_f16(x: f64) -> f16 {
+    let res;
+    unsafe {
+        asm!("xscvdphp {}, {}", out(vsreg) res, in(vsreg) x, options(pure, nostack, nomem));
+    };
+    res
+}
+
 macro_rules! check { ($func:ident, $ty:ty, $class:ident, $mov:literal) => {
     #[unsafe(no_mangle)]
     // FIXME(f128): Replace `&$ty` with `$ty` once
@@ -213,6 +255,13 @@ check!(vreg_i32x4, i32x4, vreg, "vmr");
 #[cfg(vsx)]
 check!(vreg_i64x2, i64x2, vreg, "vmr");
 
+// vsx-LABEL: vreg_f16x8:
+// vsx: #APP
+// vsx: vmr {{[0-9]+}}, {{[0-9]+}}
+// vsx: #NO_APP
+#[cfg(vsx)]
+check!(vreg_f16x8, f16x8, vreg, "vmr");
+
 // altivec-LABEL: vreg_f32x4:
 // altivec: #APP
 // altivec: vmr {{[0-9]+}}, {{[0-9]+}}
@@ -227,6 +276,13 @@ check!(vreg_f32x4, f32x4, vreg, "vmr");
 #[cfg(vsx)]
 check!(vreg_f64x2, f64x2, vreg, "vmr");
 
+// vsx-LABEL: vreg_f16:
+// vsx: #APP
+// vsx: vmr {{[0-9]+}}, {{[0-9]+}}
+// vsx: #NO_APP
+#[cfg(vsx)]
+check!(vreg_f16, f16, vreg, "vmr");
+
 // vsx-LABEL: vreg_f32:
 // vsx: #APP
 // vsx: vmr {{[0-9]+}}, {{[0-9]+}}
@@ -240,6 +296,13 @@ check!(vreg_f32, f32, vreg, "vmr");
 // vsx: #NO_APP
 #[cfg(vsx)]
 check!(vreg_f64, f64, vreg, "vmr");
+
+// vsx-LABEL: vreg_f128:
+// vsx: #APP
+// vsx: vmr {{[0-9]+}}, {{[0-9]+}}
+// vsx: #NO_APP
+#[cfg(vsx)]
+check!(vreg_f128, f128, vreg, "vmr");
 
 // vsx-LABEL: vsreg_i8x16:
 // vsx: #APP
@@ -269,6 +332,13 @@ check!(vsreg_i32x4, i32x4, vsreg, "xvsqrtdp");
 #[cfg(vsx)]
 check!(vsreg_i64x2, i64x2, vsreg, "xvsqrtdp");
 
+// vsx-LABEL: vsreg_f16x8:
+// vsx: #APP
+// vsx: xvsqrtdp {{[0-9]+}}, {{[0-9]+}}
+// vsx: #NO_APP
+#[cfg(vsx)]
+check!(vsreg_f16x8, f16x8, vsreg, "xvsqrtdp");
+
 // vsx-LABEL: vsreg_f32x4:
 // vsx: #APP
 // vsx: xvsqrtdp {{[0-9]+}}, {{[0-9]+}}
@@ -283,6 +353,13 @@ check!(vsreg_f32x4, f32x4, vsreg, "xvsqrtdp");
 #[cfg(vsx)]
 check!(vsreg_f64x2, f64x2, vsreg, "xvsqrtdp");
 
+// vsx-LABEL: vsreg_f16:
+// vsx: #APP
+// vsx: xvsqrtdp {{[0-9]+}}, {{[0-9]+}}
+// vsx: #NO_APP
+#[cfg(vsx)]
+check!(vsreg_f16, f16, vsreg, "xvsqrtdp");
+
 // vsx-LABEL: vsreg_f32:
 // vsx: #APP
 // vsx: xvsqrtdp {{[0-9]+}}, {{[0-9]+}}
@@ -296,6 +373,13 @@ check!(vsreg_f32, f32, vsreg, "xvsqrtdp");
 // vsx: #NO_APP
 #[cfg(vsx)]
 check!(vsreg_f64, f64, vsreg, "xvsqrtdp");
+
+// vsx-LABEL: vsreg_f128:
+// vsx: #APP
+// vsx: xvsqrtdp {{[0-9]+}}, {{[0-9]+}}
+// vsx: #NO_APP
+#[cfg(vsx)]
+check!(vsreg_f128, f128, vsreg, "xvsqrtdp");
 
 // CHECK-LABEL: reg_i8_r0:
 // CHECK: #APP
@@ -399,6 +483,13 @@ check_reg!(vreg_i32x4_v0, i32x4, "0", "v0", "vmr");
 #[cfg(vsx)]
 check_reg!(vreg_i64x2_v0, i64x2, "0", "v0", "vmr");
 
+// vsx-LABEL: vreg_f16x8_v0:
+// vsx: #APP
+// vsx: vmr 0, 0
+// vsx: #NO_APP
+#[cfg(vsx)]
+check_reg!(vreg_f16x8_v0, f16x8, "0", "v0", "vmr");
+
 // altivec-LABEL: vreg_f32x4_v0:
 // altivec: #APP
 // altivec: vmr 0, 0
@@ -413,6 +504,13 @@ check_reg!(vreg_f32x4_v0, f32x4, "0", "v0", "vmr");
 #[cfg(vsx)]
 check_reg!(vreg_f64x2_v0, f64x2, "0", "v0", "vmr");
 
+// vsx-LABEL: vreg_f16_v0:
+// vsx: #APP
+// vsx: vmr 0, 0
+// vsx: #NO_APP
+#[cfg(vsx)]
+check_reg!(vreg_f16_v0, f16, "0", "v0", "vmr");
+
 // vsx-LABEL: vreg_f32_v0:
 // vsx: #APP
 // vsx: vmr 0, 0
@@ -426,6 +524,13 @@ check_reg!(vreg_f32_v0, f32, "0", "v0", "vmr");
 // vsx: #NO_APP
 #[cfg(vsx)]
 check_reg!(vreg_f64_v0, f64, "0", "v0", "vmr");
+
+// vsx-LABEL: vreg_f128_v0:
+// vsx: #APP
+// vsx: vmr 0, 0
+// vsx: #NO_APP
+#[cfg(vsx)]
+check_reg!(vreg_f128_v0, f128, "0", "v0", "vmr");
 
 // altivec-LABEL: vreg_i8x16_v18:
 // altivec: #APP
@@ -455,6 +560,13 @@ check_reg!(vreg_i32x4_v18, i32x4, "18", "v18", "vmr");
 #[cfg(vsx)]
 check_reg!(vreg_i64x2_v18, i64x2, "18", "v18", "vmr");
 
+// vsx-LABEL: vreg_f16x8_v18:
+// vsx: #APP
+// vsx: vmr 18, 18
+// vsx: #NO_APP
+#[cfg(vsx)]
+check_reg!(vreg_f16x8_v18, f16x8, "18", "v18", "vmr");
+
 // altivec-LABEL: vreg_f32x4_v18:
 // altivec: #APP
 // altivec: vmr 18, 18
@@ -469,6 +581,13 @@ check_reg!(vreg_f32x4_v18, f32x4, "18", "v18", "vmr");
 #[cfg(vsx)]
 check_reg!(vreg_f64x2_v18, f64x2, "18", "v18", "vmr");
 
+// vsx-LABEL: vreg_f16_v18:
+// vsx: #APP
+// vsx: vmr 18, 18
+// vsx: #NO_APP
+#[cfg(vsx)]
+check_reg!(vreg_f16_v18, f16, "18", "v18", "vmr");
+
 // vsx-LABEL: vreg_f32_v18:
 // vsx: #APP
 // vsx: vmr 18, 18
@@ -482,6 +601,13 @@ check_reg!(vreg_f32_v18, f32, "18", "v18", "vmr");
 // vsx: #NO_APP
 #[cfg(vsx)]
 check_reg!(vreg_f64_v18, f64, "18", "v18", "vmr");
+
+// vsx-LABEL: vreg_f128_v18:
+// vsx: #APP
+// vsx: vmr 18, 18
+// vsx: #NO_APP
+#[cfg(vsx)]
+check_reg!(vreg_f128_v18, f128, "18", "v18", "vmr");
 
 // vsx-LABEL: vsreg_i8x16_vs0:
 // vsx: #APP
@@ -511,6 +637,13 @@ check_reg!(vsreg_i32x4_vs0, i32x4, "0", "vs0", "xvsqrtdp");
 #[cfg(vsx)]
 check_reg!(vsreg_i64x2_vs0, i64x2, "0", "vs0", "xvsqrtdp");
 
+// vsx-LABEL: vsreg_f16x8_vs0:
+// vsx: #APP
+// vsx: xvsqrtdp 0, 0
+// vsx: #NO_APP
+#[cfg(vsx)]
+check_reg!(vsreg_f16x8_vs0, f16x8, "0", "vs0", "xvsqrtdp");
+
 // vsx-LABEL: vsreg_f32x4_vs0:
 // vsx: #APP
 // vsx: xvsqrtdp 0, 0
@@ -525,6 +658,13 @@ check_reg!(vsreg_f32x4_vs0, f32x4, "0", "vs0", "xvsqrtdp");
 #[cfg(vsx)]
 check_reg!(vsreg_f64x2_vs0, f64x2, "0", "vs0", "xvsqrtdp");
 
+// vsx-LABEL: vsreg_f16_vs0:
+// vsx: #APP
+// vsx: xvsqrtdp 0, 0
+// vsx: #NO_APP
+#[cfg(vsx)]
+check_reg!(vsreg_f16_vs0, f16, "0", "vs0", "xvsqrtdp");
+
 // vsx-LABEL: vsreg_f32_vs0:
 // vsx: #APP
 // vsx: xvsqrtdp 0, 0
@@ -538,6 +678,13 @@ check_reg!(vsreg_f32_vs0, f32, "0", "vs0", "xvsqrtdp");
 // vsx: #NO_APP
 #[cfg(vsx)]
 check_reg!(vsreg_f64_vs0, f64, "0", "vs0", "xvsqrtdp");
+
+// vsx-LABEL: vsreg_f128_vs0:
+// vsx: #APP
+// vsx: xvsqrtdp 0, 0
+// vsx: #NO_APP
+#[cfg(vsx)]
+check_reg!(vsreg_f128_vs0, f128, "0", "vs0", "xvsqrtdp");
 
 // vsx-LABEL: vsreg_i8x16_v40:
 // vsx: #APP
@@ -567,6 +714,13 @@ check_reg!(vsreg_i32x4_v40, i32x4, "40", "vs40", "xvsqrtdp");
 #[cfg(vsx)]
 check_reg!(vsreg_i64x2_v40, i64x2, "40", "vs40", "xvsqrtdp");
 
+// vsx-LABEL: vsreg_f16x8_v40:
+// vsx: #APP
+// vsx: xvsqrtdp 40, 40
+// vsx: #NO_APP
+#[cfg(vsx)]
+check_reg!(vsreg_f16x8_v40, f16x8, "40", "vs40", "xvsqrtdp");
+
 // vsx-LABEL: vsreg_f32x4_v40:
 // vsx: #APP
 // vsx: xvsqrtdp 40, 40
@@ -581,6 +735,13 @@ check_reg!(vsreg_f32x4_v40, f32x4, "40", "vs40", "xvsqrtdp");
 #[cfg(vsx)]
 check_reg!(vsreg_f64x2_v40, f64x2, "40", "vs40", "xvsqrtdp");
 
+// vsx-LABEL: vsreg_f16_v40:
+// vsx: #APP
+// vsx: xvsqrtdp 40, 40
+// vsx: #NO_APP
+#[cfg(vsx)]
+check_reg!(vsreg_f16_v40, f16, "40", "vs40", "xvsqrtdp");
+
 // vsx-LABEL: vsreg_f32_v40:
 // vsx: #APP
 // vsx: xvsqrtdp 40, 40
@@ -594,3 +755,10 @@ check_reg!(vsreg_f32_v40, f32, "40", "vs40", "xvsqrtdp");
 // vsx: #NO_APP
 #[cfg(vsx)]
 check_reg!(vsreg_f64_v40, f64, "40", "vs40", "xvsqrtdp");
+
+// vsx-LABEL: vsreg_f128_v40:
+// vsx: #APP
+// vsx: xvsqrtdp 40, 40
+// vsx: #NO_APP
+#[cfg(vsx)]
+check_reg!(vsreg_f128_v40, f128, "40", "vs40", "xvsqrtdp");

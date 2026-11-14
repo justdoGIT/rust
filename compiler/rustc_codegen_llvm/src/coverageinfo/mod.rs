@@ -26,7 +26,7 @@ pub(crate) struct CguCoverageContext<'ll, 'tcx> {
     /// emitting covfun records. Every covfun record holds a hash of its
     /// symbol name, and `llvm-cov` will exit fatally if it can't resolve that
     /// hash back to an entry in the binary's `__llvm_prf_names` linker section.
-    pub(crate) pgo_func_name_var_map: RefCell<FxIndexMap<Instance<'tcx>, &'ll llvm::Value>>,
+    pub(crate) pgo_func_name_var_map: RefCell<FxIndexMap<Instance<'tcx>, llvm::Value<'ll>>>,
 
     covfun_section_name: OnceCell<CString>,
 }
@@ -71,10 +71,10 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
     ///
     /// This has the side-effect of causing coverage codegen to consider this
     /// function "used", making it eligible to emit an associated covfun record.
-    fn ensure_pgo_func_name_var(&self, instance: Instance<'tcx>) -> &'ll llvm::Value {
+    fn ensure_pgo_func_name_var(&self, instance: Instance<'tcx>) -> llvm::Value<'ll> {
         debug!("getting pgo_func_name_var for instance={:?}", instance);
         let mut pgo_func_name_var_map = self.coverage_cx().pgo_func_name_var_map.borrow_mut();
-        pgo_func_name_var_map.entry(instance).or_insert_with(|| {
+        *pgo_func_name_var_map.entry(instance).or_insert_with(|| {
             let llfn = self.get_fn(instance);
             let mangled_fn_name: &str = self.tcx.symbol_name(instance).name;
             llvm_cov::create_pgo_func_name_var(llfn, mangled_fn_name)
@@ -101,27 +101,25 @@ impl<'tcx> CoverageInfoBuilderMethods<'tcx> for Builder<'_, '_, 'tcx> {
         // FIXME(Zalathar): Find a better solution for mixed-coverage builds.
         let Some(_coverage_cx) = &bx.cx.coverage_cx else { return };
 
-        let Some(function_coverage_info) =
-            bx.tcx.instance_mir(instance.def).function_coverage_info.as_deref()
-        else {
+        let Some(mir_info) = bx.tcx.instance_mir(instance.def).coverage_mir_info.as_deref() else {
             debug!("function has a coverage statement but no coverage info");
             return;
         };
-        let Some(ids_info) = bx.tcx.coverage_ids_info(instance.def) else {
-            debug!("function has a coverage statement but no IDs info");
+        let Some(cg_info) = bx.tcx.coverage_codegen_info(instance.def) else {
+            debug!("function has a coverage statement but no codegen info");
             return;
         };
 
         match *kind {
-            CoverageKind::SpanMarker | CoverageKind::BlockMarker { .. } => unreachable!(
+            CoverageKind::Point { .. } | CoverageKind::BlockMarker { .. } => unreachable!(
                 "marker statement {kind:?} should have been removed by CleanupPostBorrowck"
             ),
             CoverageKind::VirtualCounter { bcb }
-                if let Some(&id) = ids_info.phys_counter_for_node.get(&bcb) =>
+                if let Some(&id) = cg_info.phys_counter_for_node.get(&bcb) =>
             {
                 let fn_name = bx.ensure_pgo_func_name_var(instance);
-                let hash = bx.const_u64(function_coverage_info.function_source_hash);
-                let num_counters = bx.const_u32(ids_info.num_counters);
+                let hash = bx.const_u64(mir_info.function_source_hash);
+                let num_counters = bx.const_u32(cg_info.num_counters);
                 let index = bx.const_u32(id.as_u32());
                 debug!(
                     "codegen intrinsic instrprof.increment(fn_name={:?}, hash={:?}, num_counters={:?}, index={:?})",

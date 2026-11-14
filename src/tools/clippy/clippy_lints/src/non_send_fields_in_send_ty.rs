@@ -4,7 +4,7 @@ use clippy_utils::is_lint_allowed;
 use clippy_utils::source::snippet;
 use clippy_utils::ty::{implements_trait, is_copy};
 use rustc_ast::ImplPolarity;
-use rustc_hir::attrs::LangItem;
+use rustc_attr_ir::LangItem;
 use rustc_hir::def_id::DefId;
 use rustc_hir::{FieldDef, Item, ItemKind, Node};
 use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
@@ -100,7 +100,7 @@ impl<'tcx> LateLintPass<'tcx> for NonSendFieldInSendTy {
                         .as_local()
                         .map(|local_def_id| cx.tcx.local_def_id_to_hir_id(local_def_id))
                         && !is_lint_allowed(cx, NON_SEND_FIELDS_IN_SEND_TY, field_hir_id)
-                        && let field_ty = field.ty(cx.tcx, impl_trait_args).skip_norm_wip()
+                        && let field_ty = field.ty(cx.tcx, *impl_trait_args).skip_norm_wip()
                         && !ty_allowed_in_send(cx, field_ty, send_trait)
                         && let Node::Field(field_def) = cx.tcx.hir_node(field_hir_id)
                     {

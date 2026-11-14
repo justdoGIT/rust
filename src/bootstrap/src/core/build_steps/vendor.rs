@@ -25,6 +25,7 @@ pub fn default_paths_to_vendor(builder: &Builder<'_>) -> Vec<(PathBuf, Vec<&'sta
         ("compiler/rustc_codegen_gcc/Cargo.toml", vec![]),
         ("library/Cargo.toml", vec![]),
         ("library/stdarch/Cargo.toml", vec![]),
+        ("library/compiler-builtins/Cargo.toml", vec![]),
         ("src/bootstrap/Cargo.toml", vec![]),
         ("src/tools/rustbook/Cargo.toml", SUBMODULES_FOR_RUSTBOOK.into()),
         ("src/tools/rustc-perf/Cargo.toml", vec!["src/tools/rustc-perf"]),
@@ -71,13 +72,21 @@ impl CommandLineStep for Vendor {
     }
 
     fn make_run(run: RunConfig<'_>) {
-        run.builder.ensure(Vendor {
+        let vendor = run.builder.ensure(Vendor {
             sync_args: run.builder.config.cmd.vendor_sync_args(),
             versioned_dirs: run.builder.config.cmd.vendor_versioned_dirs(),
             root_dir: run.builder.src.clone(),
             output_dir: None,
             only_library_workspace: false,
         });
+        // Print the config.toml contents, so that the user can manually copy it
+        if !run.builder.config.dry_run() {
+            println!("Put the following config into .cargo/config.toml:\n{}", vendor.config);
+            println!(
+                "Put the following config into library/.cargo/config.toml:\n{}",
+                vendor.config_library
+            );
+        }
     }
 
     /// Executes the vendoring process.

@@ -26,7 +26,10 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 
 mod bytewise;
+mod clamp;
 pub(crate) use bytewise::BytewiseEq;
+#[unstable(feature = "clamp_bounds", issue = "147781")]
+pub use clamp::ClampBounds;
 
 use self::Ordering::*;
 use crate::marker::{Destruct, PointeeSized};
@@ -1169,6 +1172,35 @@ pub const trait Ord: [const] Eq + [const] PartialOrd<Self> + PointeeSized {
             self
         }
     }
+
+    /// Restrict a value to a certain range.
+    ///
+    /// This is equal to `max`, `min`, or `clamp`, depending on whether the range is `min..`,
+    /// `..=max`, or `min..=max`, respectively. Exclusive ranges are not permitted.
+    ///
+    /// # Panics
+    ///
+    /// Panics on `min..=max` if `min > max`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(clamp_to)]
+    /// assert_eq!((-3).clamp_to(-2..=1), -2);
+    /// assert_eq!(0.clamp_to(-2..=1), 0);
+    /// assert_eq!(2.clamp_to(..=1), 1);
+    /// assert_eq!(5.clamp_to(7..), 7);
+    /// ```
+    #[must_use]
+    #[inline]
+    #[unstable(feature = "clamp_to", issue = "147781")]
+    fn clamp_to<R>(self, range: R) -> Self
+    where
+        Self: Sized + [const] Destruct,
+        R: [const] ClampBounds<Self>,
+    {
+        range.clamp(self)
+    }
 }
 
 /// Derive macro generating an impl of the trait [`Ord`].
@@ -1525,8 +1557,10 @@ pub const trait PartialOrd<Rhs: PointeeSized = Self>:
         self.partial_cmp(other).is_some_and(Ordering::is_ge)
     }
 
-    /// If `self == other`, returns `ControlFlow::Continue(())`.
-    /// Otherwise, returns `ControlFlow::Break(self < other)`.
+    /// If `self == other`, returns `Continue(())`.
+    /// Otherwise, returns `Break(self < other)`, or equivalently `Break(self <= other)`.
+    /// The only difference when chaining `<` and `<=` is how an equality result is
+    /// interpreted at the end of the chain.
     ///
     /// This is useful for chaining together calls when implementing a lexical
     /// `PartialOrd::lt`, as it allows types (like primitives) which can cheaply
@@ -1536,32 +1570,16 @@ pub const trait PartialOrd<Rhs: PointeeSized = Self>:
     // Added to improve the behaviour of tuples; not necessarily stabilization-track.
     #[unstable(feature = "partial_ord_chaining_methods", issue = "none")]
     #[doc(hidden)]
-    fn __chaining_lt(&self, other: &Rhs) -> ControlFlow<bool> {
+    fn __chaining_less(&self, other: &Rhs) -> ControlFlow<bool> {
         default_chaining_impl(self, other, Ordering::is_lt)
     }
 
-    /// Same as `__chaining_lt`, but for `<=` instead of `<`.
+    /// Same as `__chaining_less`, but for `>`/`>=` instead of `<`/`<=`.
     #[inline]
     #[unstable(feature = "partial_ord_chaining_methods", issue = "none")]
     #[doc(hidden)]
-    fn __chaining_le(&self, other: &Rhs) -> ControlFlow<bool> {
-        default_chaining_impl(self, other, Ordering::is_le)
-    }
-
-    /// Same as `__chaining_lt`, but for `>` instead of `<`.
-    #[inline]
-    #[unstable(feature = "partial_ord_chaining_methods", issue = "none")]
-    #[doc(hidden)]
-    fn __chaining_gt(&self, other: &Rhs) -> ControlFlow<bool> {
+    fn __chaining_greater(&self, other: &Rhs) -> ControlFlow<bool> {
         default_chaining_impl(self, other, Ordering::is_gt)
-    }
-
-    /// Same as `__chaining_lt`, but for `>=` instead of `<`.
-    #[inline]
-    #[unstable(feature = "partial_ord_chaining_methods", issue = "none")]
-    #[doc(hidden)]
-    fn __chaining_ge(&self, other: &Rhs) -> ControlFlow<bool> {
-        default_chaining_impl(self, other, Ordering::is_ge)
     }
 }
 
@@ -1935,24 +1953,19 @@ macro impl_tuples($($mac:ident,)+) {
 }
 
 /// Implementation detail for [`smallest`] and [`largest`].
-/// Marker indicating that `Self` is a tuple where all members are of the same type.
+/// Marker indicating that `Self` is a tuple where all members are of the type `T`.
+/// Cannot be an associated type as we require the empty tuple to implement this trait
+/// for all types `T`.
 #[diagnostic::on_unimplemented(message = "`{Self}` is not a homogeneous tuple")]
 #[unstable(feature = "cmp_splat_internals", issue = "160728")]
 #[rustc_const_unstable(feature = "cmp_splat_internals", issue = "160728")]
-const trait HomogeneousTuple: crate::marker::Tuple {
-    /// The type of each item in this tuple.
-    type Item;
-}
+const trait HomogeneousTuple<T>: crate::marker::Tuple {}
 
 /// Implements [`HomogeneousTuple`] for a provided tuple.
-macro impl_homogeneous_tuple($($($x:ident,)+)?) {
-    $(
-        #[unstable(feature = "cmp_splat_internals", issue = "160728")]
-        #[rustc_const_unstable(feature = "cmp_splat_internals", issue = "160728")]
-        const impl<T> HomogeneousTuple for ($(${ignore($x)}T,)+) {
-            type Item = T;
-        }
-    )?
+macro impl_homogeneous_tuple($($x:ident,)*) {
+    #[unstable(feature = "cmp_splat_internals", issue = "160728")]
+    #[rustc_const_unstable(feature = "cmp_splat_internals", issue = "160728")]
+    const impl<T> HomogeneousTuple<T> for ($(${ignore($x)}T,)*) { }
 }
 
 impl_tuples! {
@@ -2008,36 +2021,34 @@ impl_tuples! {
 #[expect(private_bounds, reason = "`SmallestArgs` is an internal implementation detail")]
 #[cfg(not(test))] // FIXME: splat interacts poorly with the double linking of `core` in tests
 pub const fn smallest<T: [const] Ord + [const] Destruct>(
-    #[rustc_splat] args: impl [const] SmallestArgs<Item = T>,
+    v1: T,
+    #[rustc_splat] args: impl [const] SmallestArgs<T>,
 ) -> T {
-    SmallestArgs::smallest(args)
+    SmallestArgs::smallest(v1, args)
 }
 
 /// Implementation detail for [`smallest`].
 #[diagnostic::on_unimplemented(message = "`{Self}` is not a valid set of arguments for `smallest`")]
 #[unstable(feature = "cmp_splat_internals", issue = "160728")]
 #[rustc_const_unstable(feature = "cmp_splat_internals", issue = "160728")]
-const trait SmallestArgs: HomogeneousTuple {
+const trait SmallestArgs<T>: HomogeneousTuple<T> {
     /// Reduces all elements of a homogeneous tuple to its smallest value.
-    fn smallest(self) -> Self::Item;
+    fn smallest(v1: T, args: Self) -> T;
 }
 
 /// Implements [`SmallestArgs`] for a provided tuple if applicable.
-macro impl_smallest_args($($x:ident, $($($y:ident,)+)?)?) {
-    $(
-        #[unstable(feature = "cmp_splat_internals", issue = "160728")]
-        #[rustc_const_unstable(feature = "cmp_splat_internals", issue = "160728")]
-        const impl<T> SmallestArgs for (T, $($(${ignore($y)}T,)+)?)
-        $(where T: [const] Destruct + [const] Ord, $(${ignore($y)})+)?
-        {
-            #[inline]
-            fn smallest(self) -> Self::Item {
-                let ($x, $($($y,)+)?) = self;
-                $($(let $x = $x.min($y);)+)?
-                $x
-            }
+macro impl_smallest_args($($x:ident,)*) {
+    #[unstable(feature = "cmp_splat_internals", issue = "160728")]
+    #[rustc_const_unstable(feature = "cmp_splat_internals", issue = "160728")]
+    const impl<T> SmallestArgs<T> for ($(${ignore($x)}T,)*)
+    where
+        T: [const] Destruct + [const] Ord,
+    {
+        #[inline(always)] // improves unoptimised codegen
+        fn smallest(v1: T, ($($x,)*): Self) -> T {
+            v1$(.min($x))*
         }
-    )?
+    }
 }
 
 impl_tuples! {
@@ -2093,36 +2104,34 @@ impl_tuples! {
 #[expect(private_bounds, reason = "`LargestArgs` is an internal implementation detail")]
 #[cfg(not(test))] // FIXME: splat interacts poorly with the double linking of `core` in tests
 pub const fn largest<T: [const] Ord + [const] Destruct>(
-    #[rustc_splat] args: impl [const] LargestArgs<Item = T>,
+    v1: T,
+    #[rustc_splat] args: impl [const] LargestArgs<T>,
 ) -> T {
-    LargestArgs::largest(args)
+    LargestArgs::largest(v1, args)
 }
 
 /// Implementation detail for [`largest`].
 #[diagnostic::on_unimplemented(message = "`{Self}` is not a valid set of arguments for `largest`")]
 #[unstable(feature = "cmp_splat_internals", issue = "160728")]
 #[rustc_const_unstable(feature = "cmp_splat_internals", issue = "160728")]
-const trait LargestArgs: HomogeneousTuple {
+const trait LargestArgs<T>: HomogeneousTuple<T> {
     /// Reduces all elements of a homogeneous tuple to its largest value.
-    fn largest(self) -> Self::Item;
+    fn largest(v1: T, args: Self) -> T;
 }
 
 /// Implements [`LargestArgs`] for a provided tuple if applicable.
-macro impl_largest_args($($x:ident, $($($y:ident,)+)?)?) {
-    $(
-        #[unstable(feature = "cmp_splat_internals", issue = "160728")]
-        #[rustc_const_unstable(feature = "cmp_splat_internals", issue = "160728")]
-        const impl<T> LargestArgs for (T, $($(${ignore($y)}T,)+)?)
-        $(where T: [const] Destruct + [const] Ord, $(${ignore($y)})+)?
-        {
-            #[inline]
-            fn largest(self) -> Self::Item {
-                let ($x, $($($y,)+)?) = self;
-                $($(let $x = $x.max($y);)+)?
-                $x
-            }
+macro impl_largest_args($($x:ident,)*) {
+    #[unstable(feature = "cmp_splat_internals", issue = "160728")]
+    #[rustc_const_unstable(feature = "cmp_splat_internals", issue = "160728")]
+    const impl<T> LargestArgs<T> for ($(${ignore($x)}T,)*)
+    where
+        T: [const] Destruct + [const] Ord,
+    {
+        #[inline(always)] // improves unoptimised codegen
+        fn largest(v1: T, ($($x,)*): Self) -> T {
+            v1$(.max($x))*
         }
-    )?
+    }
 }
 
 impl_tuples! {
@@ -2202,24 +2211,16 @@ mod impls {
             // the `Break` case and the comparison will correctly return `false`.
 
             #[inline]
-            fn __chaining_lt(&self, other: &Self) -> ControlFlow<bool> {
+            fn __chaining_less(&self, other: &Self) -> ControlFlow<bool> {
                 let (lhs, rhs) = (*self, *other);
+                // We arbitrarily pick `<` here. Using `<=` gives the same result.
                 if lhs == rhs { Continue(()) } else { Break(lhs < rhs) }
             }
             #[inline]
-            fn __chaining_le(&self, other: &Self) -> ControlFlow<bool> {
+            fn __chaining_greater(&self, other: &Self) -> ControlFlow<bool> {
                 let (lhs, rhs) = (*self, *other);
-                if lhs == rhs { Continue(()) } else { Break(lhs <= rhs) }
-            }
-            #[inline]
-            fn __chaining_gt(&self, other: &Self) -> ControlFlow<bool> {
-                let (lhs, rhs) = (*self, *other);
+                // We arbitrarily pick `>` here. Using `>=` gives the same result.
                 if lhs == rhs { Continue(()) } else { Break(lhs > rhs) }
-            }
-            #[inline]
-            fn __chaining_ge(&self, other: &Self) -> ControlFlow<bool> {
-                let (lhs, rhs) = (*self, *other);
-                if lhs == rhs { Continue(()) } else { Break(lhs >= rhs) }
             }
         };
     }
@@ -2266,8 +2267,37 @@ mod impls {
 
     partial_ord_impl! { f16 f32 f64 f128 }
 
+    macro_rules! min_max_impl {
+        (char) => {
+            #[inline]
+            fn min(self, other: Self) -> Self {
+                let c = u32::min(self as u32, other as u32);
+                // SAFETY: it's one of the inputs
+                unsafe { char::from_u32_unchecked(c) }
+            }
+
+            #[inline]
+            fn max(self, other: Self) -> Self {
+                let c = u32::max(self as u32, other as u32);
+                // SAFETY: it's one of the inputs
+                unsafe { char::from_u32_unchecked(c) }
+            }
+        };
+        ($t:ident) => {
+            #[inline]
+            fn min(self, other: Self) -> Self {
+                crate::intrinsics::integer_min(self, other)
+            }
+
+            #[inline]
+            fn max(self, other: Self) -> Self {
+                crate::intrinsics::integer_max(self, other)
+            }
+        };
+    }
+
     macro_rules! ord_impl {
-        ($($t:ty)*) => ($(
+        ($($t:ident)*) => ($(
             #[stable(feature = "rust1", since = "1.0.0")]
             #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
             const impl PartialOrd for $t {
@@ -2306,6 +2336,8 @@ mod impls {
                         self
                     }
                 }
+
+                min_max_impl!($t);
             }
         )*)
     }
@@ -2355,7 +2387,7 @@ mod impls {
 
     ord_impl! { char usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 
-    #[stable(feature = "never_type", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "never_type", since = "1.100.0")]
     #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
     const impl PartialEq for ! {
         #[inline]
@@ -2364,11 +2396,11 @@ mod impls {
         }
     }
 
-    #[stable(feature = "never_type", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "never_type", since = "1.100.0")]
     #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
     const impl Eq for ! {}
 
-    #[stable(feature = "never_type", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "never_type", since = "1.100.0")]
     #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
     const impl PartialOrd for ! {
         #[inline]
@@ -2377,7 +2409,7 @@ mod impls {
         }
     }
 
-    #[stable(feature = "never_type", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "never_type", since = "1.100.0")]
     #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
     const impl Ord for ! {
         #[inline]
@@ -2430,20 +2462,12 @@ mod impls {
             PartialOrd::ge(*self, *other)
         }
         #[inline]
-        fn __chaining_lt(&self, other: &&B) -> ControlFlow<bool> {
-            PartialOrd::__chaining_lt(*self, *other)
+        fn __chaining_less(&self, other: &&B) -> ControlFlow<bool> {
+            PartialOrd::__chaining_less(*self, *other)
         }
         #[inline]
-        fn __chaining_le(&self, other: &&B) -> ControlFlow<bool> {
-            PartialOrd::__chaining_le(*self, *other)
-        }
-        #[inline]
-        fn __chaining_gt(&self, other: &&B) -> ControlFlow<bool> {
-            PartialOrd::__chaining_gt(*self, *other)
-        }
-        #[inline]
-        fn __chaining_ge(&self, other: &&B) -> ControlFlow<bool> {
-            PartialOrd::__chaining_ge(*self, *other)
+        fn __chaining_greater(&self, other: &&B) -> ControlFlow<bool> {
+            PartialOrd::__chaining_greater(*self, *other)
         }
     }
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -2505,20 +2529,12 @@ mod impls {
             PartialOrd::ge(*self, *other)
         }
         #[inline]
-        fn __chaining_lt(&self, other: &&mut B) -> ControlFlow<bool> {
-            PartialOrd::__chaining_lt(*self, *other)
+        fn __chaining_less(&self, other: &&mut B) -> ControlFlow<bool> {
+            PartialOrd::__chaining_less(*self, *other)
         }
         #[inline]
-        fn __chaining_le(&self, other: &&mut B) -> ControlFlow<bool> {
-            PartialOrd::__chaining_le(*self, *other)
-        }
-        #[inline]
-        fn __chaining_gt(&self, other: &&mut B) -> ControlFlow<bool> {
-            PartialOrd::__chaining_gt(*self, *other)
-        }
-        #[inline]
-        fn __chaining_ge(&self, other: &&mut B) -> ControlFlow<bool> {
-            PartialOrd::__chaining_ge(*self, *other)
+        fn __chaining_greater(&self, other: &&mut B) -> ControlFlow<bool> {
+            PartialOrd::__chaining_greater(*self, *other)
         }
     }
     #[stable(feature = "rust1", since = "1.0.0")]

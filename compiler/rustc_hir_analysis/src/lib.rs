@@ -56,13 +56,11 @@ This API is completely unstable and subject to change.
 */
 
 // tidy-alphabetical-start
-#![cfg_attr(bootstrap, feature(never_type))]
 #![feature(default_field_values)]
 #![feature(gen_blocks)]
 #![feature(iter_intersperse)]
 #![feature(slice_partition_dedup)]
 #![feature(try_blocks)]
-#![feature(unwrap_infallible)]
 // tidy-alphabetical-end
 
 // These are used by Clippy.
@@ -104,12 +102,10 @@ fn check_c_variadic_abi(tcx: TyCtxt<'_>, decl: &hir::FnDecl<'_>, abi: ExternAbi,
     match abi.supports_c_variadic() {
         CVariadicStatus::Stable => {}
         CVariadicStatus::NotSupported => {
-            tcx.dcx()
-                .create_err(diagnostics::VariadicFunctionCompatibleConvention {
-                    span,
-                    convention: &format!("{abi}"),
-                })
-                .emit();
+            tcx.dcx().emit_err(diagnostics::VariadicFunctionCompatibleConvention {
+                span,
+                convention: &format!("{abi}"),
+            });
         }
         CVariadicStatus::Unstable { feature } => {
             if !tcx.features().enabled(feature) {
@@ -172,10 +168,7 @@ pub fn check_crate(tcx: TyCtxt<'_>) {
                 tcx.ensure_ok().eval_static_initializer(item_def_id);
                 check::maybe_check_static_with_link_section(tcx, item_def_id);
             }
-            DefKind::Const { .. }
-                if !tcx.generics_of(item_def_id).own_requires_monomorphization()
-                    && !tcx.is_type_const(item_def_id) =>
-            {
+            DefKind::Const if !tcx.generics_of(item_def_id).own_requires_monomorphization() => {
                 // FIXME(generic_const_items): Passing empty instead of identity args is fishy but
                 //                             seems to be fine for now. Revisit this!
                 let instance = ty::Instance::new_raw(item_def_id.into(), ty::GenericArgs::empty());

@@ -467,4 +467,31 @@ fn main() {
 "#,
         );
     }
+
+    #[test]
+    fn term_search_lookup_const() {
+        check_diagnostics(
+            r#"
+struct S { f: i32 }
+const C: i32 = 0;
+fn main() {
+    let _: S = _;
+             //^ 💡 error: invalid `_` expression, expected type `S`
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn term_search_projection_on_generic_param() {
+        check_diagnostics(
+            r#"
+trait Tr { type A; }
+fn foo<T: Tr>(s: T::A) {
+    let _x: u8 = _;
+               //^ 💡 error: invalid `_` expression, expected type `u8`
+}
+"#,
+        );
+    }
 }

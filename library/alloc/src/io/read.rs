@@ -81,7 +81,7 @@ use crate::vec::Vec;
 /// [`&str`]: prim@str
 /// [`std::io`]: crate::io
 #[stable(feature = "rust1", since = "1.0.0")]
-#[doc(notable_trait)]
+#[doc(notable_trait(color = "transparent"))]
 #[cfg_attr(not(test), rustc_diagnostic_item = "IoRead")]
 #[rustc_must_implement_one_of(read_buf, read)] // Keep this order, it's important for rust-analyzer (the preferred-to-implement method should come first).
 pub trait Read {
@@ -640,6 +640,7 @@ pub trait Read {
         self.read_buf_exact(borrowed_buf.unfilled())?;
         // Guard against incorrect `read_buf_exact` implementations.
         assert_eq!(borrowed_buf.len(), N);
+        // SAFETY: Buffer was initialised above.
         Ok(unsafe { MaybeUninit::array_assume_init(buf) })
     }
 
@@ -814,6 +815,7 @@ where
     let len_original = buf.len();
     // SAFETY: invalid UTF-8 discarded before return or unwind
     let buf_vec = unsafe { buf.as_mut_vec() };
+    // ignore-tidy-undocumented-unsafe
     let mut g = DropGuard::new((len_original, buf_vec), |(len, buf)| unsafe {
         buf.set_len(len);
     });
@@ -1018,6 +1020,7 @@ pub fn default_read_to_string<R: Read + ?Sized>(
     // To prevent extraneously checking the UTF-8-ness of the entire buffer
     // we pass it to our hardcoded `default_read_to_end` implementation which
     // we know is guaranteed to only read data into the end of the buffer.
+    // ignore-tidy-undocumented-unsafe
     unsafe { append_to_string(buf, |b| default_read_to_end(r, b, size_hint)) }
 }
 
@@ -1105,4 +1108,6 @@ macro_rules! impl_from_endian_bytes {
     )*};
 }
 
-impl_from_endian_bytes!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64);
+impl_from_endian_bytes!(
+    u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f16, f32, f64, f128
+);

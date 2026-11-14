@@ -12,15 +12,12 @@ use std::{assert_matches, collections::hash_map, fmt::Debug, hint::cold_path, me
 #[cfg(all(debug_assertions, not(miri)))]
 use std::cell::Cell;
 
-#[cfg(not(all(debug_assertions, not(miri))))]
-use std::mem::MaybeUninit;
-
 use intern::Symbol;
 use rustc_hash::FxHashMap;
 use span::{Span, SpanAnchor, SyntaxContext, TextRange, TextSize};
 
 use crate::{
-    DelimSpan, Delimiter, DelimiterKind, Ident, IdentIsRaw, Leaf, LitKind, Literal, Punct, Spacing,
+    DelimSpan, Delimiter, DelimiterKind, Ident, IdentKind, Leaf, LitKind, Literal, Punct, Spacing,
     Subtree, SubtreeView, TokenTree, TokenTreesView, TtIter,
 };
 
@@ -105,7 +102,7 @@ struct UninitBuffer {
     #[cfg(all(debug_assertions, not(miri)))]
     buffer: Box<[u8]>,
     #[cfg(not(all(debug_assertions, not(miri))))]
-    buffer: Box<[MaybeUninit<u8>]>,
+    buffer: Box<[std::mem::MaybeUninit<u8>]>,
 }
 
 impl UninitBuffer {
@@ -357,8 +354,12 @@ unsafe fn encode<'a>(
                     ptr = encode_span(ptr, &span, span_parts_map, 0b00, false);
                 }
             }
-            TokenTree::Leaf(Leaf::Ident(Ident { sym, span, is_raw })) => {
-                ptr = encode_symbol(ptr, &sym, is_raw as u32, symbols_map);
+            TokenTree::Leaf(Leaf::Ident(Ident { sym, span, kind })) => {
+                let is_not_normal = kind != IdentKind::Normal;
+                if is_not_normal {
+                    ptr.write::<u8>(kind as u8);
+                }
+                ptr = encode_symbol(ptr, &sym, u32::from(is_not_normal), symbols_map);
                 ptr = encode_span(ptr, &span, span_parts_map, 0b10, false);
             }
             TokenTree::Leaf(Leaf::Literal(Literal { text_and_suffix, span, kind, suffix_len })) => {
@@ -807,10 +808,6 @@ unsafe fn decode_extended_span(
     }
 }
 
-// FIXME: It'll probably be better to ensure this ourselves via a `#[repr(C, align(4))]` wrapper, even though practically
-// this holds for all 32- and 64-bit targets (Rust does not guarantee this).
-const _: () = assert!(align_of::<*const *const str>() >= 4); // Needed for the tagging of idents.
-
 unsafe fn decode_symbol<'a>(
     mut ptr: BufferReader<'a>,
     first_byte: u8,
@@ -830,8 +827,6 @@ unsafe fn decode_symbol<'a>(
     (ptr, symbols[symbol_idx as usize].clone())
 }
 
-/// We need `MaybeUninit` to preserve provenance.
-///
 /// The returned `u32` is the length of the children *in bytes*, if we read a subtree. Otherwise it's zero.
 unsafe fn decode<'a>(
     mut ptr: BufferReader<'a>,
@@ -855,14 +850,19 @@ unsafe fn decode<'a>(
 
             return (ptr, TokenTree::Leaf(Leaf::Punct(Punct { char, spacing, span })), 0);
         } else if span_and_extra & 0b10 == 0b10 {
-            // An ident.
+            // An ident. If not `IdentKind::Normal`, an additional byte encodes the `IdentKind`
+            // (since raw or forced-keyword idents are rare).
             let symbol_first_byte = ptr.read::<u8>();
-            let is_raw = symbol_first_byte & 0b1;
+            let is_not_normal = (symbol_first_byte & 0b1) != 0;
             let symbol;
             (ptr, symbol) = decode_symbol(ptr, symbol_first_byte, symbols);
-            let is_raw = transmute::<u8, IdentIsRaw>(is_raw);
+            let kind = if is_not_normal {
+                transmute::<u8, IdentKind>(ptr.read::<u8>())
+            } else {
+                IdentKind::Normal
+            };
 
-            return (ptr, TokenTree::Leaf(Leaf::Ident(Ident { sym: symbol, span, is_raw })), 0);
+            return (ptr, TokenTree::Leaf(Leaf::Ident(Ident { sym: symbol, span, kind })), 0);
         }
 
         let mut children_byte_len = 0;

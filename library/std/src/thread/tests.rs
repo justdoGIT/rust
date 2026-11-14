@@ -366,6 +366,19 @@ fn test_thread_os_id_not_equal() {
 }
 
 #[test]
+fn test_thread_os_id_matches_current() {
+    assert_eq!(thread::current().os_id(), crate::sys::thread::current_os_id());
+}
+
+#[test]
+fn test_thread_os_id_of_spawned_thread() {
+    let spawned = thread::spawn(|| thread::current().os_id());
+    let handle = spawned.thread().clone();
+    let spawned_id = spawned.join().unwrap();
+    assert_eq!(handle.os_id(), spawned_id);
+}
+
+#[test]
 fn test_scoped_threads_drop_result_before_join() {
     let actually_finished = &AtomicBool::new(false);
     struct X<'scope, 'env>(&'scope Scope<'scope, 'env>, &'env AtomicBool);
@@ -433,4 +446,15 @@ fn test_minimal_thread_stack() {
     let before = builder.spawn(|| COUNT.fetch_add(1, Ordering::Relaxed)).unwrap().join().unwrap();
     assert_eq!(before, 0);
     assert_eq!(COUNT.load(Ordering::Relaxed), 1);
+}
+
+// Test that a stack size too large to round up to the page size is an error.
+// The cfg mirrors the one around the rounding in the unix `Thread::new`.
+#[cfg(all(unix, not(any(target_os = "espidf", target_os = "nuttx"))))]
+// FIXME(https://github.com/rust-lang/miri/issues/5594): Miri ignores the requested stack size.
+#[cfg_attr(skip_unsupported_miri_tests, ignore)]
+#[test]
+fn test_huge_thread_stack() {
+    let builder = thread::Builder::new().stack_size(usize::MAX);
+    assert!(builder.spawn(|| {}).is_err());
 }

@@ -8,10 +8,10 @@ use clippy_utils::sugg::Sugg;
 use clippy_utils::visitors::is_const_evaluatable;
 use clippy_utils::{is_in_const_context, is_mutable, sym};
 use rustc_ast::Mutability;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_errors::Applicability;
-use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::{Expr, ExprKind, HirId};
-use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass, std_or_core};
 use rustc_middle::ty;
 use rustc_middle::ty::adjustment::{Adjust, DerefAdjustKind, OverloadedDeref};
 use rustc_span::Symbol;
@@ -88,7 +88,7 @@ impl<'tcx> LateLintPass<'tcx> for ClonedRefToSliceRefs {
             && (!is_mutable(cx, recv) || is_const_evaluatable(cx.tcx, cx.typeck_results(), recv))
 
             // get appropriate crate for `slice::from_ref`
-            && let Some(builtin_crate) = clippy_utils::std_or_core(cx)
+            && let Some(builtin_crate) = std_or_core(cx)
         {
             let mut applicability = Applicability::MachineApplicable;
             let sugg = Sugg::hir_with_context(cx, recv, expr.span.ctxt(), "_", &mut applicability);

@@ -1,7 +1,6 @@
 #![feature(deref_patterns)]
 #![feature(macro_metavar_expr)]
 #![feature(rustc_private)]
-#![feature(unwrap_infallible)]
 #![recursion_limit = "512"]
 #![expect(clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::must_use_candidate)]
 #![warn(
@@ -17,6 +16,7 @@
 // (Currently there is no way to opt into sysroot crates without `extern crate`.)
 extern crate rustc_abi;
 extern crate rustc_ast;
+extern crate rustc_attr_ir;
 extern crate rustc_attr_parsing;
 extern crate rustc_const_eval;
 extern crate rustc_data_structures;
@@ -81,13 +81,13 @@ use itertools::Itertools as _;
 use rustc_abi::Integer;
 use rustc_ast::ast::{self, LitKind, RangeLimits};
 use rustc_ast::{LitIntType, join_path_syms};
+use rustc_attr_ir::lang_items::LangItem;
+use rustc_attr_ir::lang_items::LangItem::{OptionNone, OptionSome, ResultErr, ResultOk};
+use rustc_attr_ir::{CfgEntry, find_attr};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::indexmap;
 use rustc_data_structures::packed::Pu128;
 use rustc_data_structures::unhash::UnindexMap;
-use rustc_hir::attrs::CfgEntry;
-use rustc_hir::attrs::lang_items::LangItem;
-use rustc_hir::attrs::lang_items::LangItem::{OptionNone, OptionSome, ResultErr, ResultOk};
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId, LocalModId};
 use rustc_hir::definitions::{DefPath, DefPathData};
@@ -98,7 +98,6 @@ use rustc_hir::{
     FieldDef, FnDecl, FnRetTy, GenericArg, GenericArgs, HirId, HirIdMap, HirIdSet, Impl, ImplItem, ImplItemKind, Item,
     ItemKind, LetStmt, MatchSource, Mutability, Node, OwnerId, OwnerNode, Param, Pat, PatExpr, PatExprKind, PatKind,
     Path, PathSegment, QPath, Stmt, StmtKind, TraitFn, TraitItem, TraitItemKind, TraitRef, TyKind, UnOp, Variant, def,
-    find_attr,
 };
 use rustc_lexer::{FrontmatterAllowed, TokenKind, tokenize};
 use rustc_lint::{LateContext, Level, Lint, LintContext as _};
@@ -108,9 +107,10 @@ use rustc_middle::mir::{AggregateKind, Operand, RETURN_PLACE, Rvalue, StatementK
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, AutoBorrow, DerefAdjustKind, PointerCoercion};
 use rustc_middle::ty::layout::IntegerExt as _;
 use rustc_middle::ty::{
-    self as rustc_ty, Binder, BorrowKind, ClosureKind, EarlyBinder, GenericArgKind, GenericArgsRef, IntTy, Ty, TyCtxt,
-    TypeFlags, TypeVisitableExt as _, TypeckResults, UintTy, UpvarCapture,
+    self as rustc_ty, Binder, BorrowKind, ClosureKind, EarlyBinder, GenericArgKind, IntTy, Ty, TyCtxt, TypeFlags,
+    TypeVisitableExt as _, TypeckResults, UintTy, UpvarCapture,
 };
+use rustc_session::config::Input;
 use rustc_span::hygiene::{ExpnKind, MacroKind};
 use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::{Ident, Symbol, kw};
@@ -350,8 +350,8 @@ pub fn is_wild(pat: &Pat<'_>) -> bool {
 
 /// If `pat` is:
 /// - `Some(inner)`, returns `inner`
-///    - it will _usually_ contain just one element, but could have two, given patterns like
-///      `Some(inner, ..)` or `Some(.., inner)`
+///    - it will _usually_ contain just one element, but could have two, given patterns like `Some(inner, ..)` or
+///      `Some(.., inner)`
 /// - `Some`, returns `[]`
 /// - otherwise, returns `None`
 pub fn as_some_pattern<'a, 'hir>(cx: &LateContext<'_>, pat: &'a Pat<'hir>) -> Option<&'a [Pat<'hir>]> {
@@ -390,6 +390,36 @@ pub fn is_ty_alias(qpath: &QPath<'_>) -> bool {
         QPath::Resolved(_, path) => matches!(path.res, Res::Def(DefKind::TyAlias | DefKind::AssocTy, ..)),
         QPath::TypeRelative(ty, _) if let TyKind::Path(qpath) = ty.kind => is_ty_alias(&qpath),
         QPath::TypeRelative(..) => false,
+    }
+}
+
+/// Checks if the given `Ty` is either an `impl Future` or async coroutine.
+pub fn ty_is_future<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> bool {
+    let Some(future_trait) = cx.tcx.lang_items().future_trait() else {
+        return false;
+    };
+
+    match *ty.kind() {
+        rustc_ty::Alias(_, alias) => {
+            if let rustc_ty::AliasTy {
+                kind: rustc_ty::Opaque { def_id },
+                args,
+                ..
+            } = alias
+                && let preds = cx.tcx.explicit_item_self_bounds(def_id)
+                && preds
+                    .iter_instantiated_copied(cx.tcx, args)
+                    .map(rustc_ty::Unnormalized::skip_normalization)
+                    .filter_map(|(p, _)| p.as_trait_clause())
+                    .any(|trait_pred| trait_pred.skip_binder().trait_ref.def_id == future_trait)
+            {
+                true
+            } else {
+                false
+            }
+        },
+        rustc_ty::Coroutine(def_id, _) | rustc_ty::CoroutineWitness(def_id, _) => cx.tcx.coroutine_is_async(def_id),
+        _ => false,
     }
 }
 
@@ -1670,26 +1700,8 @@ pub fn clip(tcx: TyCtxt<'_>, u: u128, ity: UintTy) -> u128 {
     (u << amt) >> amt
 }
 
-pub fn has_attr(attrs: &[hir::Attribute], symbol: Symbol) -> bool {
-    attrs.iter().any(|attr| attr.has_name(symbol))
-}
-
 pub fn has_repr_attr(cx: &LateContext<'_>, hir_id: HirId) -> bool {
     find_attr!(cx.tcx, hir_id, Repr { .. })
-}
-
-pub fn any_parent_has_attr(tcx: TyCtxt<'_>, node: HirId, symbol: Symbol) -> bool {
-    let mut prev_enclosing_node = None;
-    let mut enclosing_node = node;
-    while Some(enclosing_node) != prev_enclosing_node {
-        if has_attr(tcx.hir_attrs(enclosing_node), symbol) {
-            return true;
-        }
-        prev_enclosing_node = Some(enclosing_node);
-        enclosing_node = tcx.hir_get_parent_item(enclosing_node).into();
-    }
-
-    false
 }
 
 /// Checks if the given HIR node is inside an `impl` block with the `automatically_derived`
@@ -1700,10 +1712,16 @@ pub fn in_automatically_derived(tcx: TyCtxt<'_>, id: HirId) -> bool {
         .any(|(id, _)| find_attr!(tcx, id.def_id, AutomaticallyDerived))
 }
 
+/// Functions marked with these attributes must have an exact signature.
+pub fn requires_exact_signature(attrs: &[rustc_attr_ir::Attribute]) -> bool {
+    find_attr!(attrs, ProcMacro | ProcMacroAttribute | ProcMacroDerive { .. })
+}
+
 /// Checks if the given `DefId` matches the `libc` item.
 pub fn match_libc_symbol(cx: &LateContext<'_>, did: DefId, name: Symbol) -> bool {
-    // libc is meant to be used as a flat list of names, but they're all actually defined in different
-    // modules based on the target platform. Ignore everything but crate name and the item name.
+    // libc is meant to be used as a flat list of names, but they're all actually defined in
+    // different modules based on the target platform. Ignore everything but crate name and the
+    // item name.
     cx.tcx.crate_name(did.krate) == sym::libc && cx.tcx.def_path_str(did).ends_with(name.as_str())
 }
 
@@ -2048,16 +2066,6 @@ pub fn is_expr_temporary_value(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     })
 }
 
-pub fn std_or_core(cx: &LateContext<'_>) -> Option<&'static str> {
-    if is_no_core_crate(cx) {
-        None
-    } else if is_no_std_crate(cx) {
-        Some("core")
-    } else {
-        Some("std")
-    }
-}
-
 pub fn is_no_std_crate(cx: &LateContext<'_>) -> bool {
     find_attr!(cx.tcx, crate, NoStd)
 }
@@ -2113,7 +2121,7 @@ pub fn fn_def_id(cx: &LateContext<'_>, expr: &Expr<'_>) -> Option<DefId> {
 pub fn fn_def_id_with_node_args<'tcx>(
     cx: &LateContext<'tcx>,
     expr: &Expr<'_>,
-) -> Option<(DefId, GenericArgsRef<'tcx>)> {
+) -> Option<(DefId, rustc_ty::GenericArgs<'tcx>)> {
     let typeck = cx.typeck_results();
     match &expr.kind {
         ExprKind::MethodCall(..) => Some((
@@ -2291,8 +2299,8 @@ pub fn peel_hir_ty_refs<'a>(mut ty: &'a hir::Ty<'a>) -> (&'a hir::Ty<'a>, usize)
     let mut count = 0;
     loop {
         match &ty.kind {
-            TyKind::Ref(_, ref_ty) => {
-                ty = ref_ty.ty;
+            TyKind::Ref(_, inner_ty, _) => {
+                ty = inner_ty;
                 count += 1;
             },
             _ => break (ty, count),
@@ -2303,7 +2311,7 @@ pub fn peel_hir_ty_refs<'a>(mut ty: &'a hir::Ty<'a>) -> (&'a hir::Ty<'a>, usize)
 /// Returns the base type for HIR references and pointers.
 pub fn peel_hir_ty_refs_and_ptrs<'tcx>(ty: &'tcx hir::Ty<'tcx>) -> &'tcx hir::Ty<'tcx> {
     match &ty.kind {
-        TyKind::Ptr(mut_ty) | TyKind::Ref(_, mut_ty) => peel_hir_ty_refs_and_ptrs(mut_ty.ty),
+        TyKind::Ptr(inner_ty, _) | TyKind::Ref(_, inner_ty, _) => peel_hir_ty_refs_and_ptrs(inner_ty),
         _ => ty,
     }
 }
@@ -2360,9 +2368,9 @@ fn test_item_names(tcx: TyCtxt<'_>, module: LocalModId) -> Vec<Symbol> {
         Entry::Vacant(entry) => {
             let mut names = Vec::new();
             for id in tcx.hir_module_free_items(module) {
-                if matches!(tcx.def_kind(id.owner_id), DefKind::Const { .. })
+                if matches!(tcx.def_kind(id.owner_id), DefKind::Static { .. })
                     && let item = tcx.hir_item(id)
-                    && let ItemKind::Const(ident, _generics, ty, _body) = item.kind
+                    && let ItemKind::Static(_mut, ident, ty, _body) = item.kind
                     && let TyKind::Path(QPath::Resolved(_, path)) = ty.kind
                     // We could also check for the type name `test::TestDescAndFn`
                     && let Res::Def(DefKind::Struct, _) = path.res
@@ -2444,7 +2452,18 @@ pub fn is_in_cfg_test(tcx: TyCtxt<'_>, id: HirId) -> bool {
 
 /// Checks if the node is in a `#[test]` function or has any parent node marked `#[cfg(test)]`
 pub fn is_in_test(tcx: TyCtxt<'_>, hir_id: HirId) -> bool {
-    is_in_test_function(tcx, hir_id) || is_in_cfg_test(tcx, hir_id)
+    is_in_test_function(tcx, hir_id) || is_in_cfg_test(tcx, hir_id) || is_in_integration_test_file(tcx)
+}
+
+/// Check if the node is in an integration test file (i.e. under `tests/`).
+fn is_in_integration_test_file(tcx: TyCtxt<'_>) -> bool {
+    if let Input::File(ref path) = tcx.sess.io.input
+        && !tcx.sess.opts.unstable_opts.ui_testing
+    {
+        path.starts_with("tests")
+    } else {
+        false
+    }
 }
 
 /// Checks if the item of any of its parents has `#[cfg(...)]` attribute applied.
@@ -2788,9 +2807,11 @@ pub fn expr_use_sites<'tcx>(
                 | Node::TraitRef(_)
                 | Node::Ty(_)
                 | Node::TyPat(_)
+                | Node::NestedUseTree(_)
                 | Node::WherePredicate(_)
                 | Node::TestBinderForall(_)
-                | Node::TestBinderExists(_) => {
+                | Node::TestBinderExists(_)
+                | Node::TestBinderBoundTypeConstraint(_) => {
                     // This shouldn't be possible to hit; the inner iterator should have
                     // been moved to the end before we hit any of these nodes.
                     debug_assert!(false, "found {parent:?} which is after the final use node");
@@ -3137,7 +3158,8 @@ pub fn is_never_expr<'tcx>(cx: &LateContext<'tcx>, e: &'tcx Expr<'_>) -> Option<
                                 let in_final_expr = mem::replace(&mut self.in_final_expr, false);
                                 self.visit_expr(guard);
                                 self.in_final_expr = in_final_expr;
-                                // The compiler doesn't consider diverging guards as causing the arm to diverge.
+                                // The compiler doesn't consider diverging guards as causing the arm
+                                // to diverge.
                                 self.is_never = false;
                             }
                             self.visit_expr(arm.body);
@@ -3237,7 +3259,7 @@ pub fn get_path_from_caller_to_method_type<'tcx>(
     tcx: TyCtxt<'tcx>,
     from: LocalDefId,
     method: DefId,
-    args: GenericArgsRef<'tcx>,
+    args: rustc_ty::GenericArgs<'tcx>,
 ) -> String {
     let assoc_item = tcx.associated_item(method);
     let def_id = assoc_item.container_id(tcx);
@@ -3250,7 +3272,12 @@ pub fn get_path_from_caller_to_method_type<'tcx>(
     }
 }
 
-fn get_path_to_ty<'tcx>(tcx: TyCtxt<'tcx>, from: LocalDefId, ty: Ty<'tcx>, args: GenericArgsRef<'tcx>) -> String {
+fn get_path_to_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    from: LocalDefId,
+    ty: Ty<'tcx>,
+    args: rustc_ty::GenericArgs<'tcx>,
+) -> String {
     match ty.kind() {
         rustc_ty::Adt(adt, _) => get_path_to_callee(tcx, from, adt.did()),
         // TODO these types need to be recursively resolved as well
@@ -3491,7 +3518,7 @@ pub fn expr_requires_coercion<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>) -
                 v_def
                     .fields
                     .iter()
-                    .any(|field| field.ty(cx.tcx, generic_args).has_type_flags(TypeFlags::HAS_TY_PARAM))
+                    .any(|field| field.ty(cx.tcx, *generic_args).has_type_flags(TypeFlags::HAS_TY_PARAM))
             } else {
                 false
             }
@@ -3595,8 +3622,7 @@ pub fn is_expr_default<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) -> 
 /// - `return expr`
 /// - then or else part of a `if` in return position
 /// - arm body of a `match` in a return position
-/// - `break expr` or `break 'label expr` if the loop or block being exited is used as a return
-///   value
+/// - `break expr` or `break 'label expr` if the loop or block being exited is used as a return value
 ///
 /// Contrary to [`TyCtxt::hir_get_fn_id_for_return_block()`], if `expr` is part of a
 /// larger expression, for example a field expression of a `struct`, it will not be

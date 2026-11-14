@@ -17,6 +17,7 @@ extern crate ra_ap_rustc_parse_format as rustc_parse_format;
 
 pub extern crate ra_ap_rustc_abi as layout;
 pub extern crate ra_ap_rustc_abi as rustc_abi;
+pub extern crate ra_ap_rustc_type_ir as rustc_type_ir;
 
 pub mod attrs;
 pub mod builtin_type;
@@ -36,6 +37,7 @@ pub mod unstable_features;
 pub mod expr_store;
 pub mod hir;
 pub mod resolver;
+pub mod upvars;
 
 pub mod nameres;
 
@@ -98,6 +100,8 @@ pub use crate::{
 pub use hir_expand::{Intern, Lookup, tt};
 
 type FxIndexMap<K, V> = indexmap::IndexMap<K, V, rustc_hash::FxBuildHasher>;
+type ThinFxHashMap<K, V> = stdx::thin_map::ThinHashMap<K, V, rustc_hash::FxBuildHasher>;
+type ThinFxHashSet<T> = stdx::thin_map::ThinHashSet<T, rustc_hash::FxBuildHasher>;
 
 /// Whether to expand procedural macros during name resolution.
 ///
@@ -1442,6 +1446,7 @@ pub fn macro_call_as_call_id(
     expand_to: ExpandTo,
     krate: Crate,
     macro_depth: u32,
+    recursion_limit: u32,
     resolver: impl Fn(&ModPath) -> Option<MacroDefId> + Copy,
     eager_callback: &mut dyn FnMut(
         InFile<(syntax::AstPtr<ast::MacroCall>, span::FileAstId<ast::MacroCall>)>,
@@ -1459,6 +1464,7 @@ pub fn macro_call_as_call_id(
             def,
             call_site,
             macro_depth,
+            recursion_limit,
             &|path| resolver(path).filter(MacroDefId::is_fn_like),
             eager_callback,
         ),

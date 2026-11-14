@@ -1,6 +1,6 @@
 //! This module provides a MIR interpreter, which is used in const eval.
 
-use std::{borrow::Cow, cell::RefCell, fmt::Write, iter, mem, ops::Range};
+use std::{borrow::Cow, cell::RefCell, iter, mem, ops::Range};
 
 use base_db::{Crate, target::TargetLoadError};
 use either::Either;
@@ -12,10 +12,7 @@ use hir_def::{
     lang_item::LangItems,
     layout::{TagEncoding, Variants},
     resolver::{HasResolver, ValueNs},
-    signatures::{
-        EnumSignature, FunctionSignature, StaticFlags, StaticSignature, StructFlags,
-        StructSignature, TraitSignature,
-    },
+    signatures::{EnumSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
 };
 use hir_expand::{InFile, mod_path::path};
 use la_arena::ArenaMap;
@@ -41,7 +38,6 @@ use crate::{
     CallableDefId, ComplexMemoryMap, InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate,
     consteval::{self, ConstEvalError, try_const_usize},
     db::{GeneralConstId, HirDatabase, InternedClosureId},
-    display::{ClosureStyle, DisplayTarget, HirDisplay},
     infer::PointerCast,
     layout::{Layout, LayoutError, RustcEnumVariantIdx},
     method_resolution::{is_dyn_method, lookup_impl_const},
@@ -57,13 +53,11 @@ use crate::{
 
 use super::{
     AggregateKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirLowerError, MirSpan,
-    Operand, OperandKind, Place, PlaceElem, PlaceRef, PlaceTy, ProjectionElem, Rvalue,
-    StatementKind, TerminatorKind, UnOp, return_slot,
+    Operand, OperandKind, Place, PlaceElem, PlaceTy, ProjectionElem, Rvalue, StatementKind,
+    StoredPlace, TerminatorKind, UnOp, return_slot,
 };
 
 mod shim;
-#[cfg(test)]
-mod tests;
 
 macro_rules! from_bytes {
     ($ty:tt, $value:expr) => {
@@ -309,7 +303,6 @@ const STACK_OFFSET: usize = 1 << 30;
 const HEAP_OFFSET: usize = 1 << 29;
 
 impl Address {
-    #[allow(clippy::double_parens)]
     fn from_bytes<'db>(it: &[u8]) -> Result<'db, Self> {
         Ok(Address::from_usize(from_bytes!(usize, it)))
     }
@@ -378,148 +371,6 @@ pub enum MirEvalError<'db> {
     InternalError(Box<str>),
 }
 
-impl MirEvalError<'_> {
-    pub fn pretty_print(
-        &self,
-        f: &mut String,
-        db: &dyn HirDatabase,
-        span_formatter: impl Fn(FileId, TextRange) -> String,
-        display_target: DisplayTarget,
-    ) -> std::result::Result<(), std::fmt::Error> {
-        writeln!(f, "Mir eval error:")?;
-        let mut err = self;
-        while let MirEvalError::InFunction(e, stack) = err {
-            err = e;
-            for (func, span, def) in stack.iter().take(30).rev() {
-                match func {
-                    Either::Left(func) => {
-                        let function_name = FunctionSignature::of(db, *func);
-                        writeln!(
-                            f,
-                            "In function {} ({:?})",
-                            function_name.name.display(db, display_target.edition),
-                            func
-                        )?;
-                    }
-                    Either::Right(closure) => {
-                        writeln!(f, "In {closure:?}")?;
-                    }
-                }
-                let (source_map, self_param_syntax) = match *def {
-                    InferBodyId::DefWithBodyId(def) => {
-                        let body = &Body::with_source_map(db, def).1;
-                        (&**body, body.self_param_syntax())
-                    }
-                    InferBodyId::AnonConstId(def) => {
-                        let store = ExpressionStore::with_source_map(db, def.loc(db).owner).1;
-                        (store, None)
-                    }
-                };
-                let span: InFile<SyntaxNodePtr> = match *span {
-                    MirSpan::ExprId(e) => match source_map.expr_syntax(e) {
-                        Ok(s) => s.map(|it| it.into()),
-                        Err(_) => continue,
-                    },
-                    MirSpan::PatId(p) => match source_map.pat_syntax(p) {
-                        Ok(s) => s.map(|it| it.syntax_node_ptr()),
-                        Err(_) => continue,
-                    },
-                    MirSpan::BindingId(b) => {
-                        match source_map
-                            .patterns_for_binding(b)
-                            .iter()
-                            .find_map(|p| source_map.pat_syntax(*p).ok())
-                        {
-                            Some(s) => s.map(|it| it.syntax_node_ptr()),
-                            None => continue,
-                        }
-                    }
-                    MirSpan::SelfParam => match self_param_syntax {
-                        Some(s) => s.map(|it| it.syntax_node_ptr()),
-                        None => continue,
-                    },
-                    MirSpan::Unknown => continue,
-                };
-                let file_id = span.file_id.original_file(db);
-                let text_range = span.value.text_range();
-                writeln!(f, "{}", span_formatter(file_id.file_id(db), text_range))?;
-            }
-        }
-        match err {
-            MirEvalError::InFunction(..) => unreachable!(),
-            MirEvalError::LayoutError(err, ty) => {
-                write!(
-                    f,
-                    "Layout for type `{}` is not available due {err:?}",
-                    ty.as_ref()
-                        .display(db, display_target)
-                        .with_closure_style(ClosureStyle::ClosureWithId)
-                )?;
-            }
-            MirEvalError::MirLowerError(func, err) => {
-                let function_name = FunctionSignature::of(db, *func);
-                let self_ = match func.lookup(db).container {
-                    ItemContainerId::ImplId(impl_id) => Some({
-                        db.impl_self_ty(impl_id)
-                            .instantiate_identity()
-                            .skip_norm_wip()
-                            .display(db, display_target)
-                            .to_string()
-                    }),
-                    ItemContainerId::TraitId(it) => Some(
-                        TraitSignature::of(db, it)
-                            .name
-                            .display(db, display_target.edition)
-                            .to_string(),
-                    ),
-                    _ => None,
-                };
-                writeln!(
-                    f,
-                    "MIR lowering for function `{}{}{}` ({:?}) failed due:",
-                    self_.as_deref().unwrap_or_default(),
-                    if self_.is_some() { "::" } else { "" },
-                    function_name.name.display(db, display_target.edition),
-                    func
-                )?;
-                err.pretty_print(f, db, span_formatter, display_target)?;
-            }
-            MirEvalError::ConstEvalError(name, err) => {
-                MirLowerError::ConstEvalError((**name).into(), err.clone()).pretty_print(
-                    f,
-                    db,
-                    span_formatter,
-                    display_target,
-                )?;
-            }
-            MirEvalError::UndefinedBehavior(_)
-            | MirEvalError::TargetDataLayoutNotAvailable(_)
-            | MirEvalError::Panic(_)
-            | MirEvalError::MirLowerErrorForClosure(_, _)
-            | MirEvalError::TypeIsUnsized(_, _)
-            | MirEvalError::NotSupported(_)
-            | MirEvalError::InvalidConst
-            | MirEvalError::ExecutionLimitExceeded
-            | MirEvalError::StackOverflow
-            | MirEvalError::CoerceUnsizedError(_)
-            | MirEvalError::InternalError(_)
-            | MirEvalError::InvalidVTableId(_) => writeln!(f, "{err:?}")?,
-        }
-        Ok(())
-    }
-
-    pub fn is_panic(&self) -> Option<&str> {
-        let mut err = self;
-        while let MirEvalError::InFunction(e, _) = err {
-            err = e;
-        }
-        match err {
-            MirEvalError::Panic(msg) => Some(msg),
-            _ => None,
-        }
-    }
-}
-
 impl std::fmt::Debug for MirEvalError<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -563,11 +414,11 @@ type Result<'db, T> = std::result::Result<T, MirEvalError<'db>>;
 
 #[derive(Debug, Default)]
 struct DropFlags<'db> {
-    need_drop: FxHashSet<PlaceRef<'db>>,
+    need_drop: FxHashSet<Place<'db>>,
 }
 
 impl<'db> DropFlags<'db> {
-    fn add_place(&mut self, p: PlaceRef<'db>) {
+    fn add_place(&mut self, p: Place<'db>) {
         if p.iterate_over_parents().any(|it| self.need_drop.contains(&it)) {
             return;
         }
@@ -575,7 +426,7 @@ impl<'db> DropFlags<'db> {
         self.need_drop.insert(p);
     }
 
-    fn remove_place(&mut self, p: PlaceRef<'db>) -> bool {
+    fn remove_place(&mut self, p: Place<'db>) -> bool {
         // FIXME: replace parents with parts
         if let Some(parent) = p.iterate_over_parents().find(|it| self.need_drop.contains(it)) {
             self.need_drop.remove(&parent);
@@ -713,11 +564,11 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         self.infcx.interner.lang_items()
     }
 
-    fn place_addr(&self, p: &Place, locals: &Locals<'a, 'db>) -> Result<'db, Address> {
+    fn place_addr(&self, p: &StoredPlace, locals: &Locals<'a, 'db>) -> Result<'db, Address> {
         Ok(self.place_addr_and_ty_and_metadata(p, locals)?.0)
     }
 
-    fn place_interval(&self, p: &Place, locals: &Locals<'a, 'db>) -> Result<'db, Interval> {
+    fn place_interval(&self, p: &StoredPlace, locals: &Locals<'a, 'db>) -> Result<'db, Interval> {
         let place_addr_and_ty = self.place_addr_and_ty_and_metadata(p, locals)?;
         Ok(Interval {
             addr: place_addr_and_ty.0,
@@ -786,13 +637,13 @@ impl<'a, 'db> Evaluator<'a, 'db> {
 
     fn place_addr_and_ty_and_metadata<'b>(
         &'b self,
-        p: &Place,
+        p: &StoredPlace,
         locals: &'b Locals<'a, 'db>,
     ) -> Result<'db, (Address, Ty<'db>, Option<IntervalOrOwned>)> {
         let mut addr = locals.ptr[p.local].addr;
         let mut ty = PlaceTy::from_ty(locals.body.locals[p.local].ty.as_ref());
         let mut metadata: Option<IntervalOrOwned> = None; // locals are always sized
-        for proj in p.projection.lookup() {
+        for proj in p.projection.as_slice() {
             let prev_ty = ty;
             ty = self.projected_ty(ty, *proj);
             match proj {
@@ -814,8 +665,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         self.read_memory(locals.ptr[*op].addr, self.ptr_size())?
                     );
                     metadata = None; // Result of index is always sized
-                    let ty_size =
-                        self.size_of_sized(ty.ty, locals, "array inner type should be sized")?;
+                    let ty_size = self.size_of_sized(ty.ty, locals, "array inner type")?;
                     addr = addr.offset(ty_size * offset);
                 }
                 &ProjectionElem::ConstantIndex { from_end, offset } => {
@@ -838,8 +688,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         offset as usize
                     };
                     metadata = None; // Result of index is always sized
-                    let ty_size =
-                        self.size_of_sized(ty.ty, locals, "array inner type should be sized")?;
+                    let ty_size = self.size_of_sized(ty.ty, locals, "array inner type")?;
                     addr = addr.offset(ty_size * offset);
                 }
                 &ProjectionElem::Subslice { from, to } => {
@@ -856,8 +705,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         }
                         None => None,
                     };
-                    let ty_size =
-                        self.size_of_sized(inner_ty, locals, "array inner type should be sized")?;
+                    let ty_size = self.size_of_sized(inner_ty, locals, "array inner type")?;
                     addr = addr.offset(ty_size * (from as usize));
                 }
                 ProjectionElem::Field(f) => {
@@ -908,7 +756,11 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         self.layout(Ty::new_adt(self.interner(), adt, subst))
     }
 
-    fn place_ty<'b>(&'b self, p: &Place, locals: &'b Locals<'a, 'db>) -> Result<'db, Ty<'db>> {
+    fn place_ty<'b>(
+        &'b self,
+        p: &StoredPlace,
+        locals: &'b Locals<'a, 'db>,
+    ) -> Result<'db, Ty<'db>> {
         Ok(self.place_addr_and_ty_and_metadata(p, locals)?.1)
     }
 
@@ -1260,7 +1112,9 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     ty = z;
                     let size = if ty.is_str() {
                         if *op != BinOp::Eq {
-                            never!("Only eq is builtin for `str`");
+                            return Err(MirEvalError::NotSupported(
+                                "Only eq is builtin for `str`".to_owned(),
+                            ));
                         }
                         let ls = from_bytes!(usize, &lc[self.ptr_size()..self.ptr_size() * 2]);
                         let rs = from_bytes!(usize, &rc[self.ptr_size()..self.ptr_size() * 2]);
@@ -1503,8 +1357,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         )?)
                     }
                     AggregateKind::Union(it, f) => {
-                        let layout =
-                            self.layout_adt((*it).into(), GenericArgs::empty(self.interner()))?;
+                        let layout = self.layout_adt((*it).into(), GenericArgs::empty())?;
                         let offset = layout
                             .fields
                             .offset(u32::from(f.local_id.into_raw()) as usize)
@@ -1680,7 +1533,9 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             return Ok(0);
         };
         match &layout.variants {
-            Variants::Empty => unreachable!(),
+            Variants::Empty => Err(MirEvalError::UndefinedBehavior(
+                "reading the discriminant of an uninhabited enum".to_owned(),
+            )),
             Variants::Single { index } => {
                 let r =
                     self.const_eval_discriminant(e.enum_variants(self.db).variants[index.0].0)?;
@@ -2092,7 +1947,6 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         }
     }
 
-    #[allow(clippy::double_parens)]
     fn allocate_const_in_heap(
         &mut self,
         locals: &Locals<'a, 'db>,
@@ -2176,7 +2030,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         Ok(Interval::new(addr, size))
     }
 
-    fn eval_place(&mut self, p: &Place, locals: &Locals<'a, 'db>) -> Result<'db, Interval> {
+    fn eval_place(&mut self, p: &StoredPlace, locals: &Locals<'a, 'db>) -> Result<'db, Interval> {
         let addr = self.place_addr(p, locals)?;
         Ok(Interval::new(
             addr,
@@ -2249,7 +2103,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 self.stack.copy_within(src..src + r.size, dst)
             }
             (Heap(dst), Heap(src)) => {
-                if self.stack.len() < src + r.size || self.stack.len() < dst + r.size {
+                if self.heap.len() < src + r.size || self.heap.len() < dst + r.size {
                     return Err(oob());
                 }
                 self.heap.copy_within(src..src + r.size, dst)
@@ -2902,7 +2756,6 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                     ty,
                 };
                 let generics_for_target = GenericArgs::new_from_iter(
-                    self.interner(),
                     generic_args
                         .iter()
                         .enumerate()
@@ -3081,7 +2934,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
 
     fn drop_place(
         &mut self,
-        place: &Place,
+        place: &StoredPlace,
         locals: &mut Locals<'a, 'db>,
         span: MirSpan,
     ) -> Result<'db, ()> {

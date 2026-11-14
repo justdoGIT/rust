@@ -4,17 +4,19 @@ use std::{fmt, iter};
 
 use rustc_abi::{Float, Integer, IntegerType, Size};
 use rustc_apfloat::Float as _;
+use rustc_attr_ir::{NotableTraitColor, find_attr};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::stable_hash::{StableHash, StableHasher};
 use rustc_errors::ErrorGuaranteed;
 use rustc_hashes::Hash128;
+use rustc_hir as hir;
 use rustc_hir::def::{CtorOf, DefKind, Res};
 use rustc_hir::def_id::{CrateNum, DefId, LocalDefId};
-use rustc_hir::{self as hir, find_attr};
 use rustc_index::bit_set::GrowableBitSet;
 use rustc_macros::{StableHash, TyDecodable, TyEncodable, extension};
-use rustc_span::sym;
+use rustc_span::{bug, span_bug, sym};
 use rustc_structures::Limit;
+use rustc_type_ir::PredicateProxy;
 use rustc_type_ir::solve::SizedTraitKind;
 use smallvec::{SmallVec, smallvec};
 use tracing::{debug, instrument};
@@ -26,8 +28,8 @@ use crate::query::Providers;
 use crate::traits::ObligationCause;
 use crate::ty::layout::{FloatExt, IntegerExt};
 use crate::ty::{
-    self, Asyncness, FallibleTypeFolder, GenericArgKind, GenericArgsRef, Ty, TyCtxt, TypeFoldable,
-    TypeFolder, TypeSuperFoldable, TypeVisitableExt, Unnormalized, Upcast,
+    self, Asyncness, FallibleTypeFolder, GenericArgKind, GenericArgs, Ty, TyCtxt, TypeFoldable,
+    TypeFolder, TypeSuperFoldable, TypeVisitableExt, Unnormalized,
 };
 
 #[derive(Copy, Clone, Debug)]
@@ -164,7 +166,7 @@ impl<'tcx> TyCtxt<'tcx> {
                 | DefKind::AssocTy
                 | DefKind::Fn
                 | DefKind::AssocFn
-                | DefKind::AssocConst { .. }
+                | DefKind::AssocConst
                 | DefKind::Impl { .. },
                 def_id,
             ) => Some(def_id),
@@ -613,12 +615,12 @@ impl<'tcx> TyCtxt<'tcx> {
             | DefKind::AssocTy
             | DefKind::TyParam
             | DefKind::Fn
-            | DefKind::Const { .. }
+            | DefKind::Const
             | DefKind::ConstParam
             | DefKind::Static { .. }
             | DefKind::Ctor(_, _)
             | DefKind::AssocFn
-            | DefKind::AssocConst { .. }
+            | DefKind::AssocConst
             | DefKind::Macro(_)
             | DefKind::ExternCrate
             | DefKind::Use
@@ -770,7 +772,7 @@ impl<'tcx> TyCtxt<'tcx> {
     pub fn try_expand_impl_trait_type(
         self,
         def_id: DefId,
-        args: GenericArgsRef<'tcx>,
+        args: GenericArgs<'tcx>,
     ) -> Result<Ty<'tcx>, Ty<'tcx>> {
         let mut visitor = OpaqueTypeExpander {
             seen_opaque_tys: FxHashSet::default(),
@@ -962,7 +964,8 @@ impl<'tcx> TyCtxt<'tcx> {
             }
             ty::AliasTermKind::OpaqueTy { def_id } => Some(self.variances_of(def_id)),
             ty::AliasTermKind::InherentTy { .. }
-            | ty::AliasTermKind::InherentConst { .. }
+            | ty::AliasTermKind::InherentConstSelf { .. }
+            | ty::AliasTermKind::InherentConstImpl { .. }
             | ty::AliasTermKind::FreeTy { .. }
             | ty::AliasTermKind::FreeConst { .. }
             | ty::AliasTermKind::AnonConst { .. }
@@ -979,7 +982,7 @@ struct OpaqueTypeExpander<'tcx> {
     seen_opaque_tys: FxHashSet<DefId>,
     // Cache of all expansions we've seen so far. This is a critical
     // optimization for some large types produced by async fn trees.
-    expanded_cache: FxHashMap<(DefId, GenericArgsRef<'tcx>), Ty<'tcx>>,
+    expanded_cache: FxHashMap<(DefId, GenericArgs<'tcx>), Ty<'tcx>>,
     primary_def_id: Option<DefId>,
     found_recursion: bool,
     found_any_recursion: bool,
@@ -991,7 +994,7 @@ struct OpaqueTypeExpander<'tcx> {
 }
 
 impl<'tcx> OpaqueTypeExpander<'tcx> {
-    fn expand_opaque_ty(&mut self, def_id: DefId, args: GenericArgsRef<'tcx>) -> Option<Ty<'tcx>> {
+    fn expand_opaque_ty(&mut self, def_id: DefId, args: GenericArgs<'tcx>) -> Option<Ty<'tcx>> {
         if self.found_any_recursion {
             return None;
         }
@@ -1036,24 +1039,23 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for OpaqueTypeExpander<'tcx> {
         }
     }
 
-    fn fold_predicate(&mut self, p: ty::Predicate<'tcx>) -> ty::Predicate<'tcx> {
-        if let ty::PredicateKind::Clause(clause) = p.kind().skip_binder()
-            && let ty::ClauseKind::Projection(projection_pred) = clause
-        {
-            p.kind()
-                .rebind(ty::ProjectionClause {
-                    projection_term: projection_pred.projection_term.fold_with(self),
-                    // Don't fold the term on the RHS of the projection predicate.
-                    // This is because for default trait methods with RPITITs, we
-                    // install a `NormalizesTo(Projection(RPITIT) -> Opaque(RPITIT))`
-                    // predicate, which would trivially cause a cycle when we do
-                    // anything that requires `TypingEnv::with_post_analysis_normalized`.
-                    term: projection_pred.term,
-                })
-                .upcast(self.tcx)
-        } else {
-            p.super_fold_with(self)
-        }
+    fn fold_predicate<P: PredicateProxy<TyCtxt<'tcx>>>(&mut self, p: P) -> P {
+        // We use `map_projection` to execute the closure only if `p` is a projection clause,
+        // to implement the logic described below (i.e. avoid folding the `term`).
+        // In all other cases, fold recursively, as normal.
+        p.map_projection(self.tcx, |bound_clause| {
+            let projection_clause = bound_clause.skip_binder();
+            bound_clause.rebind(ty::ProjectionClause {
+                projection_term: projection_clause.projection_term.fold_with(self),
+                // Don't fold the term on the RHS of the projection predicate.
+                // This is because for default trait methods with RPITITs, we
+                // install a `NormalizesTo(Projection(RPITIT) -> Opaque(RPITIT))`
+                // predicate, which would trivially cause a cycle when we do
+                // anything that requires `TypingEnv::with_post_analysis_normalized`.
+                term: projection_clause.term,
+            })
+        })
+        .unwrap_or_else(|| p.super_fold_with(self))
     }
 }
 
@@ -1215,6 +1217,9 @@ impl<'tcx> Ty<'tcx> {
             | ty::Alias(..)
             | ty::Param(_)
             | ty::Placeholder(_) => false,
+
+            // FIXME(scrabsha)
+            ty::View(..) => unimplemented!(),
         }
     }
 
@@ -1265,6 +1270,9 @@ impl<'tcx> Ty<'tcx> {
             | ty::Alias(..)
             | ty::Param(_)
             | ty::Placeholder(_) => false,
+
+            // FIXME(scrabsha)
+            ty::View(..) => unimplemented!(),
         }
     }
 
@@ -1319,6 +1327,9 @@ impl<'tcx> Ty<'tcx> {
             | ty::Alias(..)
             | ty::Param(_)
             | ty::Placeholder(_) => false,
+
+            // FIXME(scrabsha)
+            ty::View(..) => unimplemented!(),
         }
     }
 
@@ -1488,6 +1499,9 @@ impl<'tcx> Ty<'tcx> {
             }
 
             ty::Foreign(_) | ty::CoroutineWitness(..) | ty::Error(_) | ty::UnsafeBinder(_) => false,
+
+            // FIXME(scrabsha)
+            ty::View(..) => unimplemented!(),
         }
     }
 
@@ -1593,6 +1607,9 @@ pub fn needs_drop_components_with_async<'tcx>(
         | ty::Coroutine(..)
         | ty::CoroutineWitness(..)
         | ty::UnsafeBinder(_) => Ok(smallvec![ty]),
+
+        // FIXME(scrabsha)
+        ty::View(..) => unimplemented!(),
     }
 }
 
@@ -1699,8 +1716,15 @@ fn is_doc_hidden(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
 }
 
 /// Determines whether an item is annotated with `doc(notable_trait)`.
-pub fn is_doc_notable_trait(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
-    find_attr!(tcx, def_id, Doc(doc) if doc.notable_trait.is_some())
+pub fn doc_notable_trait(tcx: TyCtxt<'_>, def_id: DefId) -> Option<&'_ NotableTraitColor> {
+    find_attr!(tcx, def_id, Doc(doc) if doc.notable_trait.is_some() => {
+        let (color, _span) = doc.notable_trait.as_ref()?;
+        if let Some((color, _span)) = color {
+            color
+        } else {
+            &NotableTraitColor::Transparent
+        }
+    })
 }
 
 /// Determines whether an item is an intrinsic (which may be via Abi or via the `rustc_intrinsic` attribute).
@@ -1719,7 +1743,7 @@ pub fn intrinsic_raw(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<ty::Intrinsi
         Some(ty::IntrinsicDef {
             name: tcx.item_name(def_id),
             must_be_overridden,
-            const_stable: find_attr!(tcx, def_id, RustcIntrinsicConstStableIndirect),
+            const_stable_indirect: find_attr!(tcx, def_id, RustcIntrinsicConstStableIndirect),
         })
     } else {
         None
@@ -1730,7 +1754,7 @@ pub fn provide(providers: &mut Providers) {
     *providers = Providers {
         reveal_opaque_types_in_bounds,
         is_doc_hidden,
-        is_doc_notable_trait,
+        doc_notable_trait,
         intrinsic_raw,
         ..*providers
     }

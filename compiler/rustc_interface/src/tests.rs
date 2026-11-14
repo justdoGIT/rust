@@ -14,14 +14,17 @@ use rustc_session::config::{
     CoverageOptions, DebugInfo, DumpMonoStatsFormat, ErrorOutputType, ExternEntry, ExternLocation,
     Externs, FmtDebug, FunctionReturn, IncrementalStateAssertion, InliningThreshold, Input,
     InstrumentCoverage, InstrumentMcount, InstrumentMcountOpts, InstrumentXRay, LinkSelfContained,
-    LinkerPluginLto, LocationDetail, LtoCli, MirIncludeSpans, NextSolverConfig, Offload, Options,
-    OutFileName, OutputType, OutputTypes, PAuthKey, PacRet, Passes, PatchableFunctionEntry,
-    Polonius, ProcMacroExecutionStrategy, Strip, SwitchWithOptPath, SymbolManglingVersion,
-    WasiExecModel, build_configuration, build_session_options, rustc_optgroups,
+    LinkerPluginLto, LlvmTpde, LocationDetail, LtoCli, MirIncludeSpans, NextSolverConfig, Offload,
+    Options, OutFileName, OutputType, OutputTypes, PAuthKey, PacRet, Passes,
+    PatchableFunctionEntry, Polonius, ProcMacroExecutionStrategy, Strip, SwitchWithOptPath,
+    SymbolManglingVersion, WasiExecModel, build_session_options, rustc_optgroups,
 };
 use rustc_session::search_paths::SearchPath;
 use rustc_session::utils::{CanonicalizedPath, NativeLib};
-use rustc_session::{CompilerIO, EarlyDiagCtxt, Session, build_session, getopts};
+use rustc_session::{
+    CodegenBackendInit, CompilerIO, EarlyDiagCtxt, Session, build_early_session, build_session,
+    getopts,
+};
 use rustc_span::edition::{DEFAULT_EDITION, Edition};
 use rustc_span::source_map::{RealFileLoader, SourceMapInputs};
 use rustc_span::{FileName, RealFileName, RemapPathScopeComponents, SourceFileHashAlgorithm, sym};
@@ -39,7 +42,7 @@ where
 {
     let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
     let matches = optgroups().parse(args).unwrap();
-    let sessopts = build_session_options(&mut early_dcx, &matches);
+    let sessopts = build_session_options(&mut early_dcx, &matches, true);
     let target = rustc_session::config::build_target_config(
         &early_dcx,
         &sessopts.target_triple,
@@ -66,17 +69,16 @@ where
 
         static USING_INTERNAL_FEATURES: AtomicBool = AtomicBool::new(false);
 
+        let sess = build_early_session(sessopts, target, None);
         let sess = build_session(
-            sessopts,
+            sess,
+            CodegenBackendInit::default(),
             io,
             Default::default(),
-            target,
             "",
-            None,
             &USING_INTERNAL_FEATURES,
         );
-        let cfg = parse_cfg(sess.dcx(), matches.opt_strs("cfg"));
-        let cfg = build_configuration(&sess, cfg);
+        let cfg = parse_cfg(&sess, matches.opt_strs("cfg"));
         f(sess, cfg)
     });
 }
@@ -344,7 +346,7 @@ fn test_search_paths_tracking_hash_different_order() {
     let early_dcx = EarlyDiagCtxt::new(JSON);
     const JSON: ErrorOutputType = ErrorOutputType::Json {
         pretty: false,
-        json_rendered: HumanReadableErrorType { short: false, unicode: false },
+        json_rendered: HumanReadableErrorType { no_graphics: false, short: false, unicode: false },
         color_config: ColorConfig::Never,
     };
 
@@ -637,6 +639,7 @@ fn test_codegen_options_tracking_hash() {
     tracked!(debuginfo, DebugInfo::Limited);
     tracked!(dwarf_version, Some(5));
     tracked!(embed_bitcode, false);
+    tracked!(embed_metadata, Some(false));
     tracked!(force_frame_pointers, FramePointer::Always);
     tracked!(force_unwind_tables, Some(true));
     tracked!(instrument_coverage, InstrumentCoverage::Yes);
@@ -786,6 +789,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(always_encode_mir, true);
     tracked!(annotate_moves, AnnotateMoves::Enabled(Some(1234)));
     tracked!(assume_incomplete_release, true);
+    tracked!(async_panic, false);
     tracked!(autodiff, vec![AutoDiff::Enable, AutoDiff::NoTT]);
     tracked!(autodiff_post_passes, Some("function(mem2reg,instsimplify,simplifycfg)".to_string()));
     tracked!(binary_dep_depinfo, true);
@@ -817,7 +821,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(direct_access_external_data, Some(true));
     tracked!(dual_proc_macros, true);
     tracked!(dwarf_version, Some(5));
-    tracked!(embed_metadata, false);
+    tracked!(embed_metadata, Some(false));
     tracked!(embed_source, true);
     tracked!(export_executable_symbols, true);
     tracked!(fewer_names, Some(true));
@@ -842,6 +846,8 @@ fn test_unstable_options_tracking_hash() {
     tracked!(lint_llvm_ir, true);
     tracked!(llvm_module_flag, vec![("bar".to_string(), 123, "max".to_string())]);
     tracked!(llvm_plugins, vec![String::from("plugin_name")]);
+    tracked!(llvm_tpde, Some(LlvmTpde::Only));
+    tracked!(llvm_tpde, Some(LlvmTpde::Try));
     tracked!(llvm_writable, true);
     tracked!(location_detail, LocationDetail { file: true, line: false, column: false });
     tracked!(maximal_hir_to_mir_coverage, true);
@@ -849,6 +855,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(min_function_alignment, Some(Align::EIGHT));
     tracked!(min_recursion_limit, Some(256));
     tracked!(mir_enable_passes, vec![("DestProp".to_string(), false)]);
+    tracked!(mir_move_elimination, true);
     tracked!(mir_opt_level, Some(4));
     tracked!(mir_preserve_ub, true);
     tracked!(move_size_limit, Some(4096));
@@ -856,7 +863,7 @@ fn test_unstable_options_tracking_hash() {
     // tidy-alphabetical-end
     // FIXME(#160895): We don't test this when the next-solver is enabled by default.
     if option_env!("CFG_DEFAULT_NEXT_SOLVER_GLOBALLY").is_none() {
-        tracked!(next_solver, NextSolverConfig { coherence: true, globally: true });
+        tracked!(next_solver, NextSolverConfig::Globally);
     }
     // tidy-alphabetical-start
     tracked!(no_generate_arange_section, true);
@@ -891,7 +898,6 @@ fn test_unstable_options_tracking_hash() {
     tracked!(sanitizer_kcfi_arity, Some(true));
     tracked!(sanitizer_memory_track_origins, 2);
     tracked!(sanitizer_recover, SanitizerSet::ADDRESS);
-    tracked!(saturating_float_casts, Some(true));
     tracked!(share_generics, Some(true));
     tracked!(simulate_remapped_rust_src_base, Some(PathBuf::from("/rustc/abc")));
     tracked!(small_data_threshold, Some(16));
@@ -940,32 +946,20 @@ fn test_edition_parsing() {
     let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
 
     let matches = optgroups().parse(&["--edition=2018".to_string()]).unwrap();
-    let sessopts = build_session_options(&mut early_dcx, &matches);
+    let sessopts = build_session_options(&mut early_dcx, &matches, false);
     assert!(sessopts.edition == Edition::Edition2018)
 }
 
 #[test]
 fn test_assumptions_on_binders_enables_next_solver_globally() {
-    let globally = NextSolverConfig { coherence: true, globally: true };
+    let globally = NextSolverConfig::Globally;
     let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
 
     // `-Zassumptions-on-binders` alone enables the next solver globally.
     let matches = optgroups().parse(&["-Zassumptions-on-binders".to_string()]).unwrap();
-    let opts = build_session_options(&mut early_dcx, &matches);
+    let opts = build_session_options(&mut early_dcx, &matches, false);
     assert!(opts.unstable_opts.assumptions_on_binders);
     assert_eq!(opts.unstable_opts.next_solver, globally);
-
-    // Flag order must not matter when both `-Zassumptions-on-binders` and `-Znext-solver`
-    // are present.
-    for args in [
-        ["-Zassumptions-on-binders".to_string(), "-Znext-solver=coherence".to_string()],
-        ["-Znext-solver=coherence".to_string(), "-Zassumptions-on-binders".to_string()],
-    ] {
-        let matches = optgroups().parse(&args).unwrap();
-        let opts = build_session_options(&mut early_dcx, &matches);
-        assert!(opts.unstable_opts.assumptions_on_binders);
-        assert_eq!(opts.unstable_opts.next_solver, globally);
-    }
 
     // `-Zassumptions-on-binders` overrides `-Znext-solver=no` regardless of order, since
     // the assumptions implementation requires the next solver. This also emits an early
@@ -975,7 +969,7 @@ fn test_assumptions_on_binders_enables_next_solver_globally() {
         ["-Znext-solver=no".to_string(), "-Zassumptions-on-binders".to_string()],
     ] {
         let matches = optgroups().parse(&args).unwrap();
-        let opts = build_session_options(&mut early_dcx, &matches);
+        let opts = build_session_options(&mut early_dcx, &matches, false);
         assert!(opts.unstable_opts.assumptions_on_binders);
         assert_eq!(opts.unstable_opts.next_solver, globally);
     }

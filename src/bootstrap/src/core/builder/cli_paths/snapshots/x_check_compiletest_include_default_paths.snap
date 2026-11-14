@@ -29,6 +29,7 @@ expression: check compiletest --include-default-paths
     - Set({compiler/rustc_error_messages})
     - Set({compiler/rustc_errors})
     - Set({compiler/rustc_expand})
+    - Set({compiler/rustc_expand_queries})
     - Set({compiler/rustc_feature})
     - Set({compiler/rustc_fs_util})
     - Set({compiler/rustc_graphviz})
@@ -102,9 +103,6 @@ expression: check compiletest --include-default-paths
 [Check] check::CargoMiri
     targets: [x86_64-unknown-linux-gnu]
     - Set({src/tools/miri/cargo-miri})
-[Check] check::Priroda
-    targets: [x86_64-unknown-linux-gnu]
-    - Set({src/tools/miri/priroda})
 [Check] check::MiroptTestTools
     targets: [x86_64-unknown-linux-gnu]
     - Set({src/tools/miropt-test-tools})

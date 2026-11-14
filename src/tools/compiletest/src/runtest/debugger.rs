@@ -40,9 +40,8 @@ impl DebuggerCommands {
                 continue;
             }
 
-            let Some(directive) = line_directive(file, line_number, &line) else {
-                continue;
-            };
+            let Some(directive) = line_directive(file, line_number, &line) else { continue };
+            let Ok(directive) = directive.map_err(|e| e.raise_fatal());
 
             if !directive.applies_to_test_revision(test_revision) {
                 continue;
@@ -56,10 +55,10 @@ impl DebuggerCommands {
                 ("-command", Some(command)) => commands.push(command.to_string()),
                 ("-check", Some(pattern)) => check_lines.push((line_number, pattern.to_string())),
                 ("-repr", Some(var_name)) => {
-                    // pseudo-command intercepted by `lldb_batchmode` to run custom variable
+                    // pseudo-command intercepted by `debugger_tester` to run custom variable
                     // inspection logic.
                     commands.push(format!("repr {}", var_name.trim()));
-                    // Artificially output by `lldb_batchmode` to confirm that the inspection logic
+                    // Artificially output by `debugger_tester` to confirm that the inspection logic
                     // encountered no errors.
                     check_lines.push((line_number, format!("{var_name}: Ok")));
                 }

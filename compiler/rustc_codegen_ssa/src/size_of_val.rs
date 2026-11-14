@@ -1,11 +1,10 @@
 //! Computing the size and alignment of a value.
 
 use rustc_abi::{Align, WrappingRange};
-use rustc_hir::attrs::lang_items::LangItem;
-use rustc_middle::bug;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_middle::ty::print::{with_no_trimmed_paths, with_no_visible_paths};
 use rustc_middle::ty::{self, Ty};
-use rustc_span::{DUMMY_SP, Span};
+use rustc_span::{DUMMY_SP, Span, bug};
 use tracing::{debug, trace};
 
 use crate::common::IntPredicate;
@@ -30,9 +29,9 @@ pub fn size_and_align_of_dst<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
             // Load size/align from vtable.
             let vtable = info.unwrap();
             let size = meth::VirtualIndex::from_index(ty::COMMON_VTABLE_ENTRIES_SIZE)
-                .get_usize(bx, vtable, t);
+                .get_usize(bx, vtable);
             let align = meth::VirtualIndex::from_index(ty::COMMON_VTABLE_ENTRIES_ALIGN)
-                .get_usize(bx, vtable, t);
+                .get_usize(bx, vtable);
 
             // Size is always <= isize::MAX.
             let size_bound = bx.data_layout().ptr_sized_integer().signed_max() as u128;
@@ -78,6 +77,7 @@ pub fn size_and_align_of_dst<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
                 /* fn_attrs */ None,
                 Some(fn_abi),
                 llfn,
+                ReturnSlot::Direct, // we know the ABI here
                 &[msg.0, msg.1],
                 None,
                 None,

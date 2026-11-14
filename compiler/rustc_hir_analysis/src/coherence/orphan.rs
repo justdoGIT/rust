@@ -9,8 +9,8 @@ use rustc_middle::ty::{
     self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor, TypingMode,
     Unnormalized,
 };
-use rustc_middle::{bug, span_bug};
 use rustc_span::def_id::{DefId, LocalDefId};
+use rustc_span::{bug, span_bug};
 use rustc_trait_selection::traits::{
     self, IsFirstInputType, OrphanCheckErr, OrphanCheckMode, UncoveredTyParams,
 };
@@ -97,12 +97,6 @@ pub(crate) fn orphan_check_impl(
     );
 
     if tcx.trait_is_auto(trait_def_id) {
-        // Expand free alias types (e.g. lazy type aliases) so that the checks below operate
-        // on the type the alias resolves to rather than the alias itself. Otherwise an impl
-        // whose self type is an alias expanding to an otherwise valid nominal type would be
-        // wrongly rejected, e.g. `unsafe impl Sync for Alias {}` where `type Alias = Local;`.
-        // Expansion also reveals genuinely problematic self types (trait objects, opaque
-        // types, type parameters), so those keep being rejected. See issue #157756.
         let self_ty = tcx.expand_free_alias_tys(trait_ref.self_ty());
 
         // If the impl is in the same crate as the auto-trait, almost anything
@@ -256,6 +250,9 @@ pub(crate) fn orphan_check_impl(
             }
 
             ty::Error(..) => (LocalImpl::Allow, NonlocalImpl::Allow),
+
+            // FIXME(scrabsha)
+            ty::View(..) => unimplemented!(),
         };
 
         if trait_def_id.is_local() {
@@ -321,7 +318,7 @@ fn orphan_check<'tcx>(
     // (1)  Instantiate all generic params with fresh inference vars.
     let infcx = tcx
         .infer_ctxt()
-        .with_next_trait_solver(tcx.next_trait_solver_in_coherence())
+        .with_next_trait_solver(true)
         .enable_next_solver_overflow_fcw(false)
         .build(TypingMode::Coherence);
     let cause = traits::ObligationCause::dummy();
@@ -333,7 +330,7 @@ fn orphan_check<'tcx>(
 
         let ocx = traits::ObligationCtxt::new(&infcx);
         let ty = ocx.normalize(&cause, ty::ParamEnv::empty(), Unnormalized::new_wip(user_ty));
-        let ty = infcx.resolve_vars_if_possible(ty);
+        let ty = infcx.deeply_resolve_ignoring_regions(ty);
         let errors = ocx.try_evaluate_obligations();
         if !errors.no_errors() {
             return Ok(user_ty);
@@ -377,7 +374,7 @@ fn orphan_check<'tcx>(
                         id_arg,
                     );
                 }
-                infcx.resolve_vars_if_possible(tys)
+                infcx.deeply_resolve_ignoring_regions(tys)
             });
             OrphanCheckErr::NonLocalInputType(tys)
         }
@@ -487,7 +484,7 @@ fn emit_orphan_check_error<'tcx>(
                 }
             }
 
-            diag.emit()
+            diag.emit_err()
         }
         traits::OrphanCheckErr::UncoveredTyParams(UncoveredTyParams { uncovered, local_ty }) => {
             let mut guar = None;

@@ -33,6 +33,7 @@ pub(crate) mod unify;
 
 use std::{
     cell::{OnceCell, RefCell},
+    cmp,
     convert::identity,
     fmt,
     hash::Hash,
@@ -42,16 +43,16 @@ use std::{
 use base_db::{Crate, FxIndexMap};
 use either::Either;
 use hir_def::{
-    AdtId, AssocItemId, AttrDefId, ConstId, DefWithBodyId, ExpressionStoreOwnerId, FieldId,
-    FunctionId, GenericDefId, GenericParamId, HasModule, LocalFieldId, Lookup, StaticId, TraitId,
-    TupleFieldId, TupleId, VariantId,
+    AdtId, AssocItemId, AttrDefId, DefWithBodyId, ExpressionStoreOwnerId, FieldId, FunctionId,
+    GenericDefId, GenericParamId, HasModule, LocalFieldId, Lookup, TraitId, TupleFieldId, TupleId,
+    VariantId,
     attrs::AttrFlags,
     expr_store::{Body, ExpressionStore, HygieneId, body::Param, path::Path},
-    hir::{BindingId, ExprId, ExprOrPatId, ExprOrPatIdPacked, LabelId, PatId, UnaryOp},
+    hir::{BindingId, Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked, LabelId, PatId, UnaryOp},
     lang_item::LangItems,
     layout::Integer,
     resolver::{HasResolver, ResolveValueResult, Resolver, TypeNs, ValueNs},
-    signatures::{ConstSignature, EnumSignature, FunctionSignature, StaticSignature},
+    signatures::EnumSignature,
     type_ref::{LifetimeRefId, TypeRefId},
     unstable_features::UnstableFeatures,
 };
@@ -74,7 +75,7 @@ use thin_vec::ThinVec;
 
 use crate::{
     ImplTraitId, IncorrectGenericsLenKind, InferBodyId, PathLoweringDiagnostic, Span,
-    TargetFeatures,
+    TargetFeatures, ThinFxHashMap, ThinFxHashSet, ValueTyDefId,
     closure_analysis::PlaceBase,
     consteval::{create_anon_const, path_to_const},
     db::{AnonConstId, GeneralConstId, HirDatabase, InternedOpaqueTyId},
@@ -95,26 +96,22 @@ use crate::{
         unify::resolve_completely::WriteBackCtxt,
     },
     lower::{
-        ImplTraitIdx, ImplTraitLoweringMode, LifetimeElisionKind, LifetimeLoweringMode,
-        LoweringMode, diagnostics::TyLoweringDiagnostic,
+        ImplTraitIdx, LifetimeElisionKind, LifetimeLoweringMode, LoweringMode,
+        diagnostics::TyLoweringDiagnostic,
     },
     method_resolution::CandidateId,
     next_solver::{
-        AliasTy, Const, ConstKind, DbInterner, ErrorGuaranteed, GenericArgs, Region, StoredFnSig,
-        StoredGenericArg, StoredGenericArgs, StoredTy, StoredTys, Term, Ty, TyKind, Tys,
+        AliasTy, Const, ConstKind, DbInterner, GenericArgs, Region, StoredFnSig, StoredGenericArg,
+        StoredGenericArgs, StoredTy, StoredTys, Term, Ty, TyKind, Tys,
         abi::Safety,
+        default_types,
         infer::{InferCtxt, ObligationInspector, traits::ObligationCause},
     },
     solver_errors::SolverDiagnostic,
     utils::TargetFeatureIsSafeInTarget,
 };
 
-// This lint has a false positive here. See the link below for details.
-//
-// https://github.com/rust-lang/rust/issues/57411
-#[allow(unreachable_pub)]
 pub use coerce::could_coerce;
-#[allow(unreachable_pub)]
 pub use unify::{could_unify, could_unify_deeply};
 
 use cast::{CastCheck, CastError};
@@ -152,8 +149,8 @@ pub fn infer_query_with_inspect<'db>(
         DefWithBodyId::FunctionId(f) => {
             ctx.collect_fn(f, body.self_param.map(|param| param.formal), &body.params)
         }
-        DefWithBodyId::ConstId(c) => ctx.collect_const(c, ConstSignature::of(db, c)),
-        DefWithBodyId::StaticId(s) => ctx.collect_static(s, StaticSignature::of(db, s)),
+        DefWithBodyId::ConstId(c) => ctx.collect_const_or_static(c.into()),
+        DefWithBodyId::StaticId(s) => ctx.collect_const_or_static(s.into()),
         DefWithBodyId::VariantId(v) => {
             ctx.return_ty = match EnumSignature::variant_body_type(db, v.lookup(db).parent) {
                 hir_def::layout::IntegerType::Pointer(signed) => match signed {
@@ -188,14 +185,11 @@ pub fn infer_query_with_inspect<'db>(
 }
 
 fn infer_cycle_result<'db>(
-    db: &'db dyn HirDatabase,
+    _: &'db dyn HirDatabase,
     _: salsa::Id,
     _: DefWithBodyId,
 ) -> InferenceResult<'db> {
-    InferenceResult {
-        has_errors: true,
-        ..InferenceResult::new(Ty::new_error(DbInterner::new_no_crate(db), ErrorGuaranteed))
-    }
+    InferenceResult { has_errors: true, ..InferenceResult::new() }
 }
 
 /// Infer types for an anonymous const expression.
@@ -231,14 +225,11 @@ fn infer_anon_const_query<'db>(
 }
 
 fn infer_anon_const_cycle_result<'db>(
-    db: &'db dyn HirDatabase,
+    _: &'db dyn HirDatabase,
     _: salsa::Id,
     _: AnonConstId<'db>,
 ) -> InferenceResult<'db> {
-    InferenceResult {
-        has_errors: true,
-        ..InferenceResult::new(Ty::new_error(DbInterner::new_no_crate(db), ErrorGuaranteed))
-    }
+    InferenceResult { has_errors: true, ..InferenceResult::new() }
 }
 
 fn infer_finalize<'db>(mut ctx: InferenceContext<'db>) -> InferenceResult<'db> {
@@ -285,14 +276,6 @@ pub enum ByRef {
 /// `.1` is the mutability of the binding.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct BindingMode(pub ByRef, pub Mutability);
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum InferenceTyDiagnosticSource {
-    /// Diagnostics that come from types in the body.
-    Body,
-    /// Diagnostics that come from types in fn parameters/return type, or static & const types.
-    Signature,
-}
 
 #[derive(Debug, PartialEq, Eq, Clone, TypeVisitable, TypeFoldable)]
 pub enum InferenceDiagnostic {
@@ -476,8 +459,6 @@ pub enum InferenceDiagnostic {
     },
     TyDiagnostic {
         #[type_visitable(ignore)]
-        source: InferenceTyDiagnosticSource,
-        #[type_visitable(ignore)]
         diag: TyLoweringDiagnostic,
     },
     PathDiagnostic {
@@ -558,6 +539,16 @@ pub enum InferenceDiagnostic {
         variant: VariantId,
         #[type_visitable(ignore)]
         missed_fields: Vec<LocalFieldId>,
+    },
+    InvalidPatPathRes {
+        #[type_visitable(ignore)]
+        pat: PatId,
+        #[type_visitable(ignore)]
+        res: ValueNs,
+    },
+    MatchInheritedImmRefWithMutRefPat {
+        #[type_visitable(ignore)]
+        pat: PatId,
     },
 }
 
@@ -768,45 +759,41 @@ pub enum PatAdjust {
 #[derive(Clone, PartialEq, Eq, Debug, SalsaValue)]
 pub struct InferenceResult<'db> {
     /// For each method call expr, records the function it resolves to.
-    method_resolutions: FxHashMap<ExprId, (FunctionId, StoredGenericArgs)>,
+    method_resolutions: ThinFxHashMap<ExprId, (FunctionId, StoredGenericArgs)>,
     /// For each field access expr, records the field it resolves to.
-    field_resolutions: FxHashMap<ExprId, Either<FieldId, TupleFieldId>>,
+    field_resolutions: ThinFxHashMap<ExprId, Either<FieldId, TupleFieldId>>,
     /// For each struct literal or pattern, records the variant it resolves to.
-    variant_resolutions: FxHashMap<ExprOrPatIdPacked, VariantId>,
+    variant_resolutions: ThinFxHashMap<ExprOrPatIdPacked, VariantId>,
     /// For each associated item record what it resolves to
-    assoc_resolutions: FxHashMap<ExprOrPatIdPacked, (CandidateId, StoredGenericArgs)>,
+    assoc_resolutions: ThinFxHashMap<ExprOrPatIdPacked, (CandidateId, StoredGenericArgs)>,
     /// Whenever a tuple field expression access a tuple field, we allocate a tuple id in
     /// [`InferenceContext`] and store the tuples substitution there. This map is the reverse of
     /// that which allows us to resolve a [`TupleFieldId`]s type.
     tuple_field_access_types: ThinVec<StoredTys>,
 
-    pub(crate) type_of_expr: ArenaMap<ExprId, StoredTy>,
+    pub type_of_expr: ArenaMap<ExprId, StoredTy>,
     /// For each pattern record the type it resolves to.
     ///
     /// **Note**: When a pattern type is resolved it may still contain
     /// unresolved or missing subpatterns or subpatterns of mismatched types.
-    pub(crate) type_of_pat: ArenaMap<PatId, StoredTy>,
-    pub(crate) type_of_binding: ArenaMap<BindingId, StoredTy>,
-    pub(crate) type_of_type_placeholder: FxHashMap<TypeRefId, StoredTy>,
-    pub(crate) type_of_opaque: FxHashMap<InternedOpaqueTyId<'db>, StoredTy>,
+    pub type_of_pat: ArenaMap<PatId, StoredTy>,
+    pub type_of_binding: ArenaMap<BindingId, StoredTy>,
+    pub type_of_type_placeholder: ThinFxHashMap<TypeRefId, StoredTy>,
+    pub type_of_opaque: ThinFxHashMap<InternedOpaqueTyId<'db>, StoredTy>,
 
     /// Whether there are any type-mismatching errors in the result.
     // FIXME: This isn't as useful as initially thought due to us falling back placeholders to
     // `TyKind::Error`.
     // Which will then mark this field.
-    pub(crate) has_errors: bool,
+    pub has_errors: bool,
     /// During inference this field is empty and [`InferenceContext::diagnostics`] is filled instead.
     diagnostics: ThinVec<InferenceDiagnostic>,
     // FIXME: Remove this, change it to be in `InferenceContext`:
-    nodes_with_type_mismatches: Option<Box<FxHashSet<ExprOrPatIdPacked>>>,
+    nodes_with_type_mismatches: ThinFxHashSet<ExprOrPatIdPacked>,
 
-    /// Interned `Error` type to return references to.
-    // FIXME: Remove this.
-    error_ty: StoredTy,
-
-    pub(crate) expr_adjustments: FxHashMap<ExprId, Box<[Adjustment]>>,
+    pub expr_adjustments: FxHashMap<ExprId, Box<[Adjustment]>>,
     /// Stores the types which were implicitly dereferenced in pattern binding modes.
-    pub(crate) pat_adjustments: FxHashMap<PatId, Vec<PatAdjustment>>,
+    pub pat_adjustments: ThinFxHashMap<PatId, Vec<PatAdjustment>>,
     /// Stores the binding mode (`ref` in `let ref x = 2`) of bindings.
     ///
     /// This one is tied to the `PatId` instead of `BindingId`, because in some rare cases, a binding in an
@@ -820,15 +807,15 @@ pub struct InferenceResult<'db> {
     /// }
     /// ```
     /// the first `rest` has implicit `ref` binding mode, but the second `rest` binding mode is `move`.
-    pub(crate) binding_modes: ArenaMap<PatId, BindingMode>,
+    pub binding_modes: ArenaMap<PatId, BindingMode>,
 
     /// Set of reference patterns that match against a match-ergonomics inserted reference
     /// (as opposed to against a reference in the scrutinee type).
-    skipped_ref_pats: FxHashSet<PatId>,
+    skipped_ref_pats: ThinFxHashSet<PatId>,
 
-    pub(crate) coercion_casts: FxHashSet<ExprId>,
+    pub coercion_casts: ThinFxHashSet<ExprId>,
 
-    pub closures_data: FxHashMap<ExprId, ClosureData>,
+    pub closures_data: ThinFxHashMap<ExprId, ClosureData>,
 
     defined_anon_consts: ThinVec<AnonConstId<'db>>,
 }
@@ -1075,16 +1062,32 @@ pub struct CaptureInfo {
 /// during `typeck`, specifically by `regionck`.
 #[derive(Eq, PartialEq, Clone, Debug, Copy, Hash)]
 pub enum UpvarCapture {
-    /// Upvar is captured by value. This is always true when the
-    /// closure is labeled `move`, but can also be true in other cases
-    /// depending on inference.
-    ByValue,
+    /// Upvar is captured by reference.
+    ByRef(BorrowKind),
 
     /// Upvar is captured by use. This is true when the closure is labeled `use`.
     ByUse,
 
-    /// Upvar is captured by reference.
-    ByRef(BorrowKind),
+    /// Upvar is captured by value. This is always true when the
+    /// closure is labeled `move`, but can also be true in other cases
+    /// depending on inference.
+    ByValue,
+}
+
+// Used in closure::analysis::determine_capture_info
+impl PartialOrd for UpvarCapture {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        match (self, other) {
+            (Self::ByValue, Self::ByValue) | (Self::ByUse, Self::ByUse) => {
+                Some(cmp::Ordering::Equal)
+            }
+            (Self::ByValue | Self::ByUse, Self::ByRef(_)) => Some(cmp::Ordering::Greater),
+            (Self::ByRef(_), Self::ByValue | Self::ByUse) => Some(cmp::Ordering::Less),
+            (Self::ByRef(left), Self::ByRef(right)) => Some(left.cmp(right)),
+            (Self::ByUse, Self::ByValue) | (Self::ByValue, Self::ByUse) => None,
+        }
+    }
 }
 
 #[salsa::tracked]
@@ -1119,7 +1122,7 @@ impl<'db> InferenceResult<'db> {
 }
 
 impl<'db> InferenceResult<'db> {
-    fn new(error_ty: Ty<'_>) -> Self {
+    fn new() -> Self {
         Self {
             method_resolutions: Default::default(),
             field_resolutions: Default::default(),
@@ -1135,7 +1138,6 @@ impl<'db> InferenceResult<'db> {
             type_of_opaque: Default::default(),
             skipped_ref_pats: Default::default(),
             has_errors: Default::default(),
-            error_ty: error_ty.store(),
             pat_adjustments: Default::default(),
             binding_modes: Default::default(),
             expr_adjustments: Default::default(),
@@ -1185,7 +1187,7 @@ impl<'db> InferenceResult<'db> {
         }
     }
     pub fn expr_or_pat_has_type_mismatch(&self, node: ExprOrPatIdPacked) -> bool {
-        self.nodes_with_type_mismatches.as_ref().is_some_and(|it| it.contains(&node))
+        self.nodes_with_type_mismatches.contains(&node)
     }
     pub fn expr_has_type_mismatch(&self, expr: ExprId) -> bool {
         self.expr_or_pat_has_type_mismatch(expr.into())
@@ -1194,12 +1196,10 @@ impl<'db> InferenceResult<'db> {
         self.expr_or_pat_has_type_mismatch(pat.into())
     }
     pub fn exprs_have_type_mismatches(&self) -> bool {
-        self.nodes_with_type_mismatches
-            .as_ref()
-            .is_some_and(|it| it.iter().any(|node| node.is_expr()))
+        self.nodes_with_type_mismatches.iter().any(|node| node.is_expr())
     }
     pub fn has_type_mismatches(&self) -> bool {
-        self.nodes_with_type_mismatches.is_some()
+        !self.nodes_with_type_mismatches.is_empty()
     }
     pub fn placeholder_types<'a>(&self) -> impl Iterator<Item = (TypeRefId, Ty<'a>)> {
         self.type_of_type_placeholder.iter().map(|(&type_ref, ty)| (type_ref, ty.as_ref()))
@@ -1289,19 +1289,19 @@ impl<'db> InferenceResult<'db> {
     }
 
     pub fn expr_ty<'a>(&self, id: ExprId) -> Ty<'a> {
-        self.type_of_expr.get(id).map_or(self.error_ty.as_ref(), |it| it.as_ref())
+        self.type_of_expr.get(id).map_or(default_types().types.error, |it| it.as_ref())
     }
 
     pub fn pat_ty<'a>(&self, id: PatId) -> Ty<'a> {
-        self.type_of_pat.get(id).map_or(self.error_ty.as_ref(), |it| it.as_ref())
+        self.type_of_pat.get(id).map_or(default_types().types.error, |it| it.as_ref())
     }
 
     pub fn expr_or_pat_ty<'a>(&self, id: ExprOrPatId) -> Ty<'a> {
-        self.type_of_expr_or_pat(id).unwrap_or(self.error_ty.as_ref())
+        self.type_of_expr_or_pat(id).unwrap_or(default_types().types.error)
     }
 
     pub fn binding_ty<'a>(&self, id: BindingId) -> Ty<'a> {
-        self.type_of_binding.get(id).map_or(self.error_ty.as_ref(), |it| it.as_ref())
+        self.type_of_binding.get(id).map_or(default_types().types.error, |it| it.as_ref())
     }
 
     /// This does not deduplicate, which means you'll get the types once per capture.
@@ -1439,9 +1439,9 @@ impl<'db> InferenceContext<'db> {
     ) -> Self {
         let trait_env = db.trait_environment(generic_def);
         let table = unify::InferenceTable::new(db, trait_env, resolver.krate(), owner);
-        let types = crate::next_solver::default_types(db);
+        let types = crate::next_solver::default_types();
         InferenceContext {
-            result: InferenceResult::new(types.types.error),
+            result: InferenceResult::new(),
             return_ty: types.types.error, // set in collect_* calls
             types,
             target_features: OnceCell::new(),
@@ -1488,7 +1488,6 @@ impl<'db> InferenceContext<'db> {
             type_of_opaque,
             has_errors: _,
             diagnostics: _,
-            error_ty: _,
             expr_adjustments,
             pat_adjustments,
             binding_modes,
@@ -1498,9 +1497,9 @@ impl<'db> InferenceContext<'db> {
             nodes_with_type_mismatches,
             defined_anon_consts: _,
         } = &mut self.result;
-        merge_hash_maps(method_resolutions, &other.method_resolutions);
-        merge_hash_maps(variant_resolutions, &other.variant_resolutions);
-        merge_hash_maps(assoc_resolutions, &other.assoc_resolutions);
+        merge_thin_hash_maps(method_resolutions, &other.method_resolutions);
+        merge_thin_hash_maps(variant_resolutions, &other.variant_resolutions);
+        merge_thin_hash_maps(assoc_resolutions, &other.assoc_resolutions);
         field_resolutions.extend(other.field_resolutions.iter().map(
             |(&field_expr, &field_resolution)| {
                 let mut field_resolution = field_resolution;
@@ -1515,23 +1514,22 @@ impl<'db> InferenceContext<'db> {
         merge_arena_maps(type_of_expr, &other.type_of_expr);
         merge_arena_maps(type_of_pat, &other.type_of_pat);
         merge_arena_maps(type_of_binding, &other.type_of_binding);
-        merge_hash_maps(type_of_type_placeholder, &other.type_of_type_placeholder);
-        merge_hash_maps(type_of_opaque, &other.type_of_opaque);
+        merge_thin_hash_maps(type_of_type_placeholder, &other.type_of_type_placeholder);
+        merge_thin_hash_maps(type_of_opaque, &other.type_of_opaque);
         merge_hash_maps(expr_adjustments, &other.expr_adjustments);
-        merge_hash_maps(pat_adjustments, &other.pat_adjustments);
+        merge_thin_hash_maps(pat_adjustments, &other.pat_adjustments);
         merge_arena_maps(binding_modes, &other.binding_modes);
-        merge_hash_set(skipped_ref_pats, &other.skipped_ref_pats);
-        merge_hash_set(coercion_casts, &other.coercion_casts);
-        merge_hash_maps(closures_data, &other.closures_data);
-        if let Some(other_nodes_with_type_mismatches) = &other.nodes_with_type_mismatches {
-            merge_hash_set(
-                nodes_with_type_mismatches.get_or_insert_default(),
-                other_nodes_with_type_mismatches,
-            );
-        }
+        merge_thin_hash_set(skipped_ref_pats, &other.skipped_ref_pats);
+        merge_thin_hash_set(coercion_casts, &other.coercion_casts);
+        merge_thin_hash_maps(closures_data, &other.closures_data);
+        merge_thin_hash_set(nodes_with_type_mismatches, &other.nodes_with_type_mismatches);
         self.defined_anon_consts.borrow_mut().extend(other.defined_anon_consts.iter().copied());
+        self.diagnostics.extend(&other.diagnostics);
 
-        fn merge_hash_set<T: Hash + Eq + Clone>(dest: &mut FxHashSet<T>, source: &FxHashSet<T>) {
+        fn merge_thin_hash_set<T: Hash + Eq + Clone>(
+            dest: &mut ThinFxHashSet<T>,
+            source: &ThinFxHashSet<T>,
+        ) {
             dest.extend(source.iter().cloned());
         }
 
@@ -1539,6 +1537,20 @@ impl<'db> InferenceContext<'db> {
         fn merge_hash_maps<K: Hash + Eq + Clone, V: Clone + PartialEq>(
             dest: &mut FxHashMap<K, V>,
             source: &FxHashMap<K, V>,
+        ) {
+            if cfg!(debug_assertions) {
+                for (key, src) in source {
+                    assert!(dest.get(key).is_none_or(|dst| dst == src));
+                }
+            }
+
+            dest.extend(source.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+
+        #[cfg_attr(debug_assertions, track_caller)]
+        fn merge_thin_hash_maps<K: Hash + Eq + Clone, V: Clone + PartialEq>(
+            dest: &mut ThinFxHashMap<K, V>,
+            source: &ThinFxHashMap<K, V>,
         ) {
             if cfg!(debug_assertions) {
                 for (key, src) in source {
@@ -1629,10 +1641,6 @@ impl<'db> InferenceContext<'db> {
         self.defined_anon_consts.borrow_mut().append(&mut defined_anon_consts);
     }
 
-    // FIXME: This function should be private in module. It is currently only used in the consteval, since we need
-    // `InferenceResult` in the middle of inference. See the fixme comment in `consteval::eval_to_const`. If you
-    // used this function for another workaround, mention it here. If you really need this function and believe that
-    // there is no problem in it being `pub(crate)`, remove this comment.
     fn resolve_all(self) -> InferenceResult<'db> {
         let InferenceContext {
             table,
@@ -1659,7 +1667,6 @@ impl<'db> InferenceContext<'db> {
             skipped_ref_pats,
             closures_data,
             has_errors,
-            error_ty: _,
             pat_adjustments,
             binding_modes: _,
             expr_adjustments,
@@ -1695,10 +1702,10 @@ impl<'db> InferenceContext<'db> {
         type_of_type_placeholder.shrink_to_fit();
         type_of_opaque.shrink_to_fit();
 
-        if let Some(nodes_with_type_mismatches) = nodes_with_type_mismatches {
+        if !nodes_with_type_mismatches.is_empty() {
             *has_errors = true;
-            nodes_with_type_mismatches.shrink_to_fit();
         }
+        nodes_with_type_mismatches.shrink_to_fit();
         for (_, subst) in method_resolutions.values_mut() {
             resolver.resolve_completely(subst);
         }
@@ -1768,28 +1775,9 @@ impl<'db> InferenceContext<'db> {
         result
     }
 
-    fn collect_const(&mut self, id: ConstId, data: &'db ConstSignature) {
-        let return_ty = self.make_ty(
-            data.type_ref,
-            &data.store,
-            InferenceTyDiagnosticSource::Signature,
-            ExpressionStoreOwnerId::Signature(id.into()),
-            LifetimeElisionKind::for_const(self.interner(), id.loc(self.db).container),
-        );
-
-        self.return_ty = return_ty;
-    }
-
-    fn collect_static(&mut self, id: StaticId, data: &'db StaticSignature) {
-        let return_ty = self.make_ty(
-            data.type_ref,
-            &data.store,
-            InferenceTyDiagnosticSource::Signature,
-            ExpressionStoreOwnerId::Signature(id.into()),
-            LifetimeElisionKind::Elided(self.types.regions.statik),
-        );
-
-        self.return_ty = return_ty;
+    fn collect_const_or_static(&mut self, id: ValueTyDefId) {
+        let return_ty = self.db.value_ty(id).unwrap().instantiate_identity().skip_norm_wip();
+        self.return_ty = self.process_remote_user_written_ty(return_ty);
     }
 
     fn collect_fn(
@@ -1798,63 +1786,40 @@ impl<'db> InferenceContext<'db> {
         self_param: Option<BindingId>,
         params: &[Param<PatId>],
     ) {
-        let data = FunctionSignature::of(self.db, func);
-        let mut param_tys = self.with_ty_lowering(
-            &data.store,
-            InferenceTyDiagnosticSource::Signature,
-            ExpressionStoreOwnerId::Signature(func.into()),
-            LifetimeElisionKind::for_fn_params(data),
-            |ctx| data.params.iter().map(|&type_ref| ctx.lower_ty(type_ref)).collect::<Vec<_>>(),
+        let sig = self.interner().liberate_late_bound_regions(
+            func.into(),
+            self.db.callable_item_signature(func.into()).instantiate_identity().skip_norm_wip(),
         );
 
-        // Check if function contains a va_list, if it does then we append it to the parameter types
-        // that are collected from the function data
-        if data.is_varargs() {
-            let va_list_ty = match self.resolve_va_list() {
-                Some(va_list) => Ty::new_adt(
-                    self.interner(),
-                    va_list,
-                    GenericArgs::for_item_with_defaults(
-                        self.interner(),
-                        va_list.into(),
-                        |_, id, _| self.table.var_for_def(id, Span::Dummy),
-                    ),
-                ),
-                None => self.err_ty(),
-            };
+        // C-variadic fns also have a `VaList` input that's not listed in `fn_sig`
+        // (as it's created inside the body itself, not passed in from outside).
+        let maybe_va_list =
+            if sig.fn_sig_kind.c_variadic() { self.resolve_va_list() } else { None };
+        let maybe_va_list = maybe_va_list.map(|va_list| {
+            let region = self.table.next_region_var(
+                params.last().expect("variadic function must have parameters").user_written.into(),
+            );
+            Ty::new_adt(self.interner(), va_list, GenericArgs::new_from_slice(&[region.into()]))
+        });
 
-            param_tys.push(va_list_ty);
-        }
-        let mut param_tys = param_tys.into_iter();
+        let mut param_tys = sig.inputs().iter().copied();
+
         if let Some(self_param) = self_param
             && let Some(ty) = param_tys.next()
         {
-            let ty = self.process_user_written_ty(ty);
+            let ty = self.process_remote_user_written_ty(ty);
             self.write_binding_ty(self_param, ty);
         }
+
+        let mut param_tys = param_tys.chain(maybe_va_list);
         for pat in params {
             let ty = param_tys.next().unwrap_or_else(|| self.table.next_ty_var(Span::Dummy));
-            let ty = self.process_user_written_ty(ty);
+            let ty = self.process_remote_user_written_ty(ty);
 
             self.infer_top_pat(pat.formal, ty, PatOrigin::Param);
         }
-        self.return_ty = match data.ret_type {
-            Some(return_ty) => {
-                let return_ty = self.with_ty_lowering(
-                    &data.store,
-                    InferenceTyDiagnosticSource::Signature,
-                    ExpressionStoreOwnerId::Signature(func.into()),
-                    LifetimeElisionKind::for_fn_ret(self.interner()),
-                    |ctx| {
-                        ctx.impl_trait_mode(ImplTraitLoweringMode::Opaque);
-                        ctx.lower_ty(return_ty)
-                    },
-                );
-                self.process_user_written_ty(return_ty)
-            }
-            None => self.types.types.unit,
-        };
 
+        self.return_ty = self.process_remote_user_written_ty(sig.output());
         self.return_coercion = Some(CoerceMany::new(self.return_ty));
     }
 
@@ -1987,74 +1952,31 @@ impl<'db> InferenceContext<'db> {
         self.deferred_call_resolutions.remove(&closure_def_id).unwrap_or_default()
     }
 
-    fn with_ty_lowering<R>(
-        &mut self,
-        store: &'db ExpressionStore,
-        types_source: InferenceTyDiagnosticSource,
-        store_owner: ExpressionStoreOwnerId,
-        lifetime_elision: LifetimeElisionKind<'db>,
-        f: impl FnOnce(&mut TyLoweringContext<'db, '_>) -> R,
-    ) -> R {
-        let infer_vars = match types_source {
-            InferenceTyDiagnosticSource::Body => Some(&mut InferenceTyLoweringVarsCtx {
-                table: &mut self.table,
-                type_of_type_placeholder: &mut self.result.type_of_type_placeholder,
-            } as _),
-            InferenceTyDiagnosticSource::Signature => None,
+    fn with_ty_lowering<R>(&mut self, f: impl FnOnce(&mut TyLoweringContext<'db, '_>) -> R) -> R {
+        let mut infer_vars = InferenceTyLoweringVarsCtx {
+            table: &mut self.table,
+            type_of_type_placeholder: &mut self.result.type_of_type_placeholder,
         };
         let mut ctx = TyLoweringContext::new(
             self.db,
             &self.resolver,
-            store,
+            self.store,
             &self.diagnostics,
-            types_source,
-            store_owner,
+            self.store_owner,
             self.generic_def,
             &self.generics,
-            lifetime_elision,
+            LifetimeElisionKind::Infer,
             self.allow_using_generic_params,
-            infer_vars,
+            &mut infer_vars,
             &self.defined_anon_consts,
             LifetimeLoweringMode::LateParam,
         );
         f(&mut ctx)
     }
 
-    fn with_body_ty_lowering<R>(
-        &mut self,
-        f: impl FnOnce(&mut TyLoweringContext<'db, '_>) -> R,
-    ) -> R {
-        self.with_ty_lowering(
-            self.store,
-            InferenceTyDiagnosticSource::Body,
-            self.store_owner,
-            LifetimeElisionKind::Infer,
-            f,
-        )
-    }
-
-    fn make_ty(
-        &mut self,
-        type_ref: TypeRefId,
-        store: &'db ExpressionStore,
-        type_source: InferenceTyDiagnosticSource,
-        store_owner: ExpressionStoreOwnerId,
-        lifetime_elision: LifetimeElisionKind<'db>,
-    ) -> Ty<'db> {
-        let ty = self.with_ty_lowering(store, type_source, store_owner, lifetime_elision, |ctx| {
-            ctx.lower_ty(type_ref)
-        });
+    pub(crate) fn make_ty(&mut self, type_ref: TypeRefId) -> Ty<'db> {
+        let ty = self.with_ty_lowering(|ctx| ctx.lower_ty(type_ref));
         self.process_user_written_ty(ty)
-    }
-
-    pub(crate) fn make_body_ty(&mut self, type_ref: TypeRefId) -> Ty<'db> {
-        self.make_ty(
-            type_ref,
-            self.store,
-            InferenceTyDiagnosticSource::Body,
-            self.store_owner,
-            LifetimeElisionKind::Infer,
-        )
     }
 
     fn generics(&self) -> &Generics<'db> {
@@ -2067,12 +1989,7 @@ impl<'db> InferenceContext<'db> {
         })
     }
 
-    pub(crate) fn create_body_anon_const(
-        &mut self,
-        expr: ExprId,
-        expected_ty: Ty<'db>,
-        allow_using_generic_params: bool,
-    ) -> Const<'db> {
+    pub(crate) fn create_anon_const(&mut self, expr: ExprId, expected_ty: Ty<'db>) -> Const<'db> {
         never!(expected_ty.has_infer(), "cannot have infer vars in an anon const's ty");
         let konst = create_anon_const(
             self.interner(),
@@ -2084,7 +2001,11 @@ impl<'db> InferenceContext<'db> {
             &|| self.generics(),
             Some(&mut |span| self.table.next_const_var(span)),
             self.lowering_mode,
-            (!(allow_using_generic_params && self.allow_using_generic_params)).then_some(0),
+            (!self.allow_using_generic_params).then_some(0),
+            // The situation around body anon consts using generic params is complicated.
+            // rustc disallows them all, except for array repeat expressions. However in another place even repeat exprs
+            // are disallowed, so in practice they cause an error.
+            false,
         );
 
         if let Ok(konst) = konst
@@ -2100,7 +2021,7 @@ impl<'db> InferenceContext<'db> {
         konst.unwrap_or_else(|_| self.table.next_const_var(Span::Dummy))
     }
 
-    pub(crate) fn make_path_as_body_const(&mut self, path: &Path) -> Const<'db> {
+    pub(crate) fn make_path_as_const(&mut self, path: &Path) -> Const<'db> {
         let forbid_params_after = if self.allow_using_generic_params { None } else { Some(0) };
         // FIXME: Report errors.
         path_to_const(self.db, &self.resolver, &|| self.generics(), forbid_params_after, path)
@@ -2111,14 +2032,8 @@ impl<'db> InferenceContext<'db> {
         self.types.types.error
     }
 
-    pub(crate) fn make_body_lifetime(&mut self, lifetime_ref: LifetimeRefId) -> Region<'db> {
-        let lt = self.with_ty_lowering(
-            self.store,
-            InferenceTyDiagnosticSource::Body,
-            self.store_owner,
-            LifetimeElisionKind::Infer,
-            |ctx| ctx.lower_lifetime(lifetime_ref),
-        );
+    pub(crate) fn make_lifetime(&mut self, lifetime_ref: LifetimeRefId) -> Region<'db> {
+        let lt = self.with_ty_lowering(|ctx| ctx.lower_lifetime(lifetime_ref));
         self.insert_type_vars(lt)
     }
 
@@ -2218,13 +2133,20 @@ impl<'db> InferenceContext<'db> {
         if result.is_ty_var() { self.type_must_be_known_at_this_point(node, ty) } else { result }
     }
 
+    pub(crate) fn innermost_tail_expr(&self, mut expr: ExprId) -> ExprId {
+        while let Expr::Block { tail: Some(tail), label: None, .. } = self.store[expr] {
+            expr = tail;
+        }
+        expr
+    }
+
     pub(crate) fn emit_type_mismatch(
         &mut self,
         node: ExprOrPatIdPacked,
         expected: Ty<'db>,
         found: Ty<'db>,
     ) {
-        if self.result.nodes_with_type_mismatches.get_or_insert_default().insert(node) {
+        if self.result.nodes_with_type_mismatches.insert(node) {
             self.diagnostics.push(InferenceDiagnostic::TypeMismatch {
                 node,
                 expected: expected.store(),
@@ -2347,13 +2269,12 @@ impl<'db> InferenceContext<'db> {
             &self.resolver,
             self.store,
             &self.diagnostics,
-            InferenceTyDiagnosticSource::Body,
             self.store_owner,
             self.generic_def,
             &self.generics,
             LifetimeElisionKind::Infer,
             self.allow_using_generic_params,
-            Some(&mut vars_ctx),
+            &mut vars_ctx,
             &self.defined_anon_consts,
             LifetimeLoweringMode::LateParam,
         );

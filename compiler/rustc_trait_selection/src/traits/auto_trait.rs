@@ -81,6 +81,19 @@ impl<'tcx> AutoTraitFinder<'tcx> {
     ) -> AutoTraitResult<A> {
         let tcx = self.tcx;
 
+        // Without `#![feature(forget_trait)]`, assume absolutely all types are forget.
+        // Without `#![feature(move_trait)]`, assume absolutely all types are move.
+        if !tcx.features().forget_trait() && tcx.is_forget_trait(trait_did)
+            || !tcx.features().move_trait() && tcx.is_move_trait(trait_did)
+        {
+            let info = AutoTraitInfo {
+                full_user_env: typing_env.param_env,
+                region_data: Default::default(),
+                vid_to_region: Default::default(),
+            };
+            return AutoTraitResult::PositiveImpl(auto_trait_callback(info));
+        }
+
         if tcx.next_trait_solver_globally() {
             return self.find_auto_trait_generics_next_solver(
                 ty,
@@ -173,9 +186,11 @@ impl<'tcx> AutoTraitFinder<'tcx> {
         }
 
         let outlives_env = OutlivesEnvironment::new(&infcx, CRATE_DEF_ID, full_env, []);
-        let _ = infcx.process_registered_region_obligations(&outlives_env, DUMMY_SP);
+        let _ = infcx.process_registered_region_obligations(&outlives_env);
 
-        let region_data = infcx.inner.borrow_mut().unwrap_region_constraints().data().clone();
+        // FIXME(-Zassumptions-on-binders): Handle solver_data
+        let region_data =
+            infcx.inner.borrow_mut().unwrap_region_constraints().legacy_data().clone();
 
         let vid_to_region = self.map_vid_to_region(&region_data);
 
@@ -236,8 +251,10 @@ impl<'tcx> AutoTraitFinder<'tcx> {
                 .upcast(tcx)
             })
             .collect::<Vec<ty::Clause<'tcx>>>();
+
         let full_user_env = ty::ParamEnv::new(
-            tcx.mk_clauses_from_iter(orig_env.caller_bounds().iter().chain(field_clauses)),
+            tcx,
+            orig_env.caller_bounds().all_clauses(tcx).iter().chain(field_clauses),
         );
 
         let fresh_args = infcx.fresh_args_for_item(DUMMY_SP, adt_def.did());
@@ -310,7 +327,7 @@ impl<'tcx> AutoTraitFinder<'tcx> {
         // Don't try to process any nested obligations involving predicates
         // that are already in the `ParamEnv` (modulo regions): we already
         // know that they must hold.
-        for clause in param_env.caller_bounds() {
+        for clause in param_env.caller_bounds().all_clauses(infcx.tcx).iter() {
             fresh_preds.insert(self.clean_pred(infcx, clause.as_predicate()));
         }
 
@@ -325,8 +342,10 @@ impl<'tcx> AutoTraitFinder<'tcx> {
             polarity: ty::ClausePolarity::Positive,
         }));
 
-        let computed_clauses = param_env.caller_bounds().iter();
-        let mut user_computed_clauses: FxIndexSet<_> = user_env.caller_bounds().iter().collect();
+        let computed_clauses =
+            param_env.caller_bounds().all_clauses(infcx.tcx).iter().collect::<Vec<_>>();
+        let mut user_computed_clauses: FxIndexSet<_> =
+            user_env.caller_bounds().all_clauses(infcx.tcx).iter().collect();
 
         let mut new_env = param_env;
         let dummy_cause = ObligationCause::dummy();
@@ -336,9 +355,9 @@ impl<'tcx> AutoTraitFinder<'tcx> {
                 continue;
             }
 
-            // Call `infcx.resolve_vars_if_possible` to see if we can
+            // Call `infcx.deeply_resolve_ignoring_regions` to see if we can
             // get rid of any inference variables.
-            let obligation = infcx.resolve_vars_if_possible(Obligation::new(
+            let obligation = infcx.deeply_resolve_ignoring_regions(Obligation::new(
                 tcx,
                 dummy_cause.clone(),
                 new_env,
@@ -401,13 +420,12 @@ impl<'tcx> AutoTraitFinder<'tcx> {
 
             let normalized_preds = elaborate(
                 tcx,
-                computed_clauses.clone().chain(user_computed_clauses.iter().cloned()),
+                computed_clauses.iter().copied().chain(user_computed_clauses.iter().cloned()),
             );
-            new_env = ty::ParamEnv::new(tcx.mk_clauses_from_iter(normalized_preds));
+            new_env = ty::ParamEnv::new(tcx, normalized_preds);
         }
 
-        let final_user_env =
-            ty::ParamEnv::new(tcx.mk_clauses_from_iter(user_computed_clauses.into_iter()));
+        let final_user_env = ty::ParamEnv::new(tcx, user_computed_clauses.into_iter());
         debug!(
             "evaluate_nested_obligations(ty={:?}, trait_did={:?}): succeeded with '{:?}' \
              '{:?}'",
@@ -623,7 +641,7 @@ impl<'tcx> AutoTraitFinder<'tcx> {
         finished_map
     }
 
-    fn is_param_no_infer(&self, args: GenericArgsRef<'tcx>) -> bool {
+    fn is_param_no_infer(&self, args: GenericArgs<'tcx>) -> bool {
         self.is_of_param(args.type_at(0)) && !args.terms().any(|t| t.has_infer_types())
     }
 
@@ -661,7 +679,7 @@ impl<'tcx> AutoTraitFinder<'tcx> {
                 fresh_preds.insert(self.clean_pred(selcx.infcx, obligation.predicate));
 
             // Resolve any inference variables that we can, to help selection succeed
-            let predicate = selcx.infcx.resolve_vars_if_possible(obligation.predicate);
+            let predicate = selcx.infcx.deeply_resolve_ignoring_regions(obligation.predicate);
 
             // We only add a predicate as a user-displayable bound if
             // it involves a generic parameter, and doesn't contain

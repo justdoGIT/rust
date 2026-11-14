@@ -323,6 +323,8 @@ impl str {
     /// Converts a slice of bytes to a string slice without checking
     /// that the string contains valid UTF-8; mutable version.
     ///
+    /// # Safety
+    ///
     /// See the immutable version, [`from_utf8_unchecked()`] for documentation and safety requirements.
     ///
     /// # Examples
@@ -510,7 +512,6 @@ impl str {
     #[rustc_const_stable(feature = "str_as_bytes", since = "1.39.0")]
     #[must_use]
     #[inline(always)]
-    #[allow(unused_attributes)]
     pub const fn as_bytes(&self) -> &[u8] {
         // SAFETY: const sound because we transmute two types with the same layout
         unsafe { mem::transmute(self) }
@@ -583,10 +584,10 @@ impl str {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_const_stable(feature = "rustc_str_as_ptr", since = "1.32.0")]
-    #[rustc_never_returns_null_ptr]
-    #[rustc_as_ptr]
     #[must_use]
     #[inline(always)]
+    #[lint::as_ptr]
+    #[lint::never_returns_null_ptr]
     pub const fn as_ptr(&self) -> *const u8 {
         self as *const str as *const u8
     }
@@ -601,11 +602,11 @@ impl str {
     /// modified in a way that it remains valid UTF-8.
     #[stable(feature = "str_as_mut_ptr", since = "1.36.0")]
     #[rustc_const_stable(feature = "const_str_as_mut", since = "1.83.0")]
-    #[rustc_never_returns_null_ptr]
-    #[rustc_as_ptr]
     #[must_use]
     #[inline(always)]
     #[rustc_no_writable]
+    #[lint::as_ptr]
+    #[lint::never_returns_null_ptr]
     pub const fn as_mut_ptr(&mut self) -> *mut u8 {
         self as *mut str as *mut u8
     }
@@ -996,9 +997,18 @@ impl str {
     /// The caller must ensure that `mid` is a valid byte offset from the start
     /// of the string and falls on the boundary of a UTF-8 code point.
     #[inline]
-    const unsafe fn split_at_unchecked(&self, mid: usize) -> (&str, &str) {
+    #[must_use]
+    #[unstable(feature = "str_split_at_unchecked", issue = "165545")]
+    pub const unsafe fn split_at_unchecked(&self, mid: usize) -> (&str, &str) {
         let len = self.len();
         let ptr = self.as_ptr();
+
+        assert_unsafe_precondition!(
+            check_library_ub,
+            "str::split_at_unchecked requires the index to be on a UTF-8 boundary",
+            (it: &str = self, mid: usize = mid) => it.is_char_boundary(mid),
+        );
+
         // SAFETY: caller guarantees `mid` is on a char boundary.
         unsafe {
             (
@@ -1014,9 +1024,19 @@ impl str {
     ///
     /// The caller must ensure that `mid` is a valid byte offset from the start
     /// of the string and falls on the boundary of a UTF-8 code point.
-    const unsafe fn split_at_mut_unchecked(&mut self, mid: usize) -> (&mut str, &mut str) {
+    #[inline]
+    #[must_use]
+    #[unstable(feature = "str_split_at_unchecked", issue = "165545")]
+    pub const unsafe fn split_at_mut_unchecked(&mut self, mid: usize) -> (&mut str, &mut str) {
         let len = self.len();
         let ptr = self.as_mut_ptr();
+
+        assert_unsafe_precondition!(
+            check_library_ub,
+            "str::split_at_mut_unchecked requires the index to be on a UTF-8 boundary",
+            (it: &str = self, mid: usize = mid) => it.is_char_boundary(mid),
+        );
+
         // SAFETY: caller guarantees `mid` is on a char boundary.
         unsafe {
             (
@@ -1263,8 +1283,7 @@ impl str {
     #[stable(feature = "split_ascii_whitespace", since = "1.34.0")]
     #[inline]
     pub fn split_ascii_whitespace(&self) -> SplitAsciiWhitespace<'_> {
-        let inner =
-            self.as_bytes().split(IsAsciiWhitespace).filter(BytesIsNotEmpty).map(UnsafeBytesToStr);
+        let inner = self.as_bytes().split_ascii_whitespace().inner.map(UnsafeBytesToStr);
         SplitAsciiWhitespace { inner }
     }
 
@@ -2546,8 +2565,6 @@ impl str {
     /// # Examples
     ///
     /// ```
-    /// #![feature(trim_prefix_suffix)]
-    ///
     /// // Prefix present - removes it
     /// assert_eq!("foo:bar".trim_prefix("foo:"), "bar");
     /// assert_eq!("foofoo".trim_prefix("foo"), "foo");
@@ -2560,7 +2577,7 @@ impl str {
     /// ```
     #[must_use = "this returns the remaining substring as a new slice, \
                   without modifying the original"]
-    #[unstable(feature = "trim_prefix_suffix", issue = "142312")]
+    #[stable(feature = "trim_prefix_suffix", since = "1.100.0")]
     pub fn trim_prefix<P: Pattern>(&self, prefix: P) -> &str {
         prefix.strip_prefix_of(self).unwrap_or(self)
     }
@@ -2583,8 +2600,6 @@ impl str {
     /// # Examples
     ///
     /// ```
-    /// #![feature(trim_prefix_suffix)]
-    ///
     /// // Suffix present - removes it
     /// assert_eq!("bar:foo".trim_suffix(":foo"), "bar");
     /// assert_eq!("foofoo".trim_suffix("foo"), "foo");
@@ -2597,7 +2612,7 @@ impl str {
     /// ```
     #[must_use = "this returns the remaining substring as a new slice, \
                   without modifying the original"]
-    #[unstable(feature = "trim_prefix_suffix", issue = "142312")]
+    #[stable(feature = "trim_prefix_suffix", since = "1.100.0")]
     pub fn trim_suffix<P: Pattern>(&self, suffix: P) -> &str
     where
         for<'a> P::Searcher<'a>: ReverseSearcher<'a>,
@@ -2917,7 +2932,7 @@ impl str {
     /// Converts this string to its ASCII upper case equivalent in-place.
     ///
     /// ASCII letters 'a' to 'z' are mapped to 'A' to 'Z',
-    /// but non-ASCII letters are unchanged.
+    /// but all other characters are unchanged.
     ///
     /// To return a new uppercased value without modifying the existing one, use
     /// [`to_ascii_uppercase()`].
@@ -2945,7 +2960,7 @@ impl str {
     /// Converts this string to its ASCII lower case equivalent in-place.
     ///
     /// ASCII letters 'A' to 'Z' are mapped to 'a' to 'z',
-    /// but non-ASCII letters are unchanged.
+    /// but all other characters are unchanged.
     ///
     /// To return a new lowercased value without modifying the existing one, use
     /// [`to_ascii_lowercase()`].
@@ -3120,9 +3135,6 @@ impl str {
 
     /// Returns an iterator that escapes each char in `self` with [`char::escape_debug`].
     ///
-    /// Note: only extended grapheme codepoints that begin the string will be
-    /// escaped.
-    ///
     /// # Examples
     ///
     /// As an iterator:
@@ -3156,15 +3168,7 @@ impl str {
                   without modifying the original"]
     #[stable(feature = "str_escape", since = "1.34.0")]
     pub fn escape_debug(&self) -> EscapeDebug<'_> {
-        let mut chars = self.chars();
-        EscapeDebug {
-            inner: chars
-                .next()
-                .map(|first| first.escape_debug_ext(EscapeDebugExtArgs::ESCAPE_ALL))
-                .into_iter()
-                .flatten()
-                .chain(chars.flat_map(CharEscapeDebugContinue)),
-        }
+        EscapeDebug { inner: self.chars().flat_map(CharEscapeDebug) }
     }
 
     /// Returns an iterator that escapes each char in `self` with [`char::escape_default`].
@@ -3328,12 +3332,8 @@ impl_fn_for_zst! {
     };
 
     #[derive(Clone)]
-    struct CharEscapeDebugContinue impl Fn = |c: char| -> char::EscapeDebug {
-        c.escape_debug_ext(EscapeDebugExtArgs {
-            escape_grapheme_extender: false,
-            escape_single_quote: true,
-            escape_double_quote: true
-        })
+    struct CharEscapeDebug impl Fn = |c: char| -> char::EscapeDebug {
+        c.escape_debug_ext(EscapeDebugExtArgs::ESCAPE_ALL)
     };
 
     #[derive(Clone)]
@@ -3351,7 +3351,7 @@ impl_fn_for_zst! {
     };
 
     #[derive(Clone)]
-    struct IsAsciiWhitespace impl Fn = |byte: &u8| -> bool {
+    pub(crate) struct IsAsciiWhitespace impl Fn = |byte: &u8| -> bool {
         byte.is_ascii_whitespace()
     };
 
@@ -3361,7 +3361,7 @@ impl_fn_for_zst! {
     };
 
     #[derive(Clone)]
-    struct BytesIsNotEmpty impl<'a, 'b> Fn = |s: &'a &'b [u8]| -> bool {
+    pub(crate) struct BytesIsNotEmpty impl<'a, 'b> Fn = |s: &'a &'b [u8]| -> bool {
         !s.is_empty()
     };
 

@@ -1,9 +1,10 @@
 //! Conversion of internal Rust compiler `ty` items to stable ones.
 
 use rustc_middle::ty::Ty;
-use rustc_middle::{bug, mir, ty};
+use rustc_middle::{mir, ty};
 use rustc_public_bridge::Tables;
 use rustc_public_bridge::context::CompilerCtxt;
+use rustc_span::bug;
 
 use crate::alloc;
 use crate::compiler_interface::BridgeTys;
@@ -60,7 +61,8 @@ impl<'tcx> Stable<'tcx> for ty::AliasTerm<'tcx> {
             | ty::AliasTermKind::AnonConst { def_id }
             | ty::AliasTermKind::ProjectionConst { def_id }
             | ty::AliasTermKind::FreeConst { def_id }
-            | ty::AliasTermKind::InherentConst { def_id } => def_id,
+            | ty::AliasTermKind::InherentConstSelf { def_id }
+            | ty::AliasTermKind::InherentConstImpl { def_id } => def_id,
         };
         crate::ty::AliasTerm { def_id: tables.alias_def(def_id), args: args.stable(tables, cx) }
     }
@@ -506,6 +508,9 @@ impl<'tcx> Stable<'tcx> for ty::TyKind<'tcx> {
             ty::Placeholder(..) | ty::Infer(_) | ty::Error(_) => {
                 unreachable!();
             }
+
+            // FIXME(scrabsha)
+            ty::View(..) => unimplemented!(),
         }
     }
 }
@@ -555,9 +560,13 @@ impl<'tcx> Stable<'tcx> for ty::Const<'tcx> {
             }
             ty::ConstKind::Param(param) => crate::ty::TyConstKind::Param(param.stable(tables, cx)),
             ty::ConstKind::Alias(_, alias_const) => {
-                let Some(def_id) = alias_const.kind.opt_def_id() else {
-                    // FIXME: implement (both AliasTy and AliasConst will be needing this soon)
-                    panic!("non-defid alias consts are not supported by rustc_public at the moment")
+                // rustc_public must change its API once we introduce a variant without a def_id.
+                let def_id = match alias_const.kind {
+                    ty::AliasConstKind::Projection { def_id }
+                    | ty::AliasConstKind::InherentSelf { def_id }
+                    | ty::AliasConstKind::InherentImpl { def_id }
+                    | ty::AliasConstKind::Free { def_id }
+                    | ty::AliasConstKind::Anon { def_id } => def_id,
                 };
                 crate::ty::TyConstKind::Unevaluated(
                     tables.const_def(def_id),
@@ -699,7 +708,7 @@ impl<'tcx> Stable<'tcx> for rustc_middle::ty::GenericParamDefKind {
             ty::GenericParamDefKind::Type { has_default, synthetic } => {
                 GenericParamDefKind::Type { has_default, synthetic }
             }
-            ty::GenericParamDefKind::Const { has_default } => {
+            ty::GenericParamDefKind::Const { has_default, arg_pos: _ } => {
                 GenericParamDefKind::Const { has_default }
             }
         }
@@ -1033,7 +1042,7 @@ impl<'tcx> Stable<'tcx> for rustc_abi::ExternAbi {
             ExternAbi::CmseNonSecureEntry => Abi::CCmseNonSecureEntry,
             ExternAbi::System { unwind } => Abi::System { unwind },
             ExternAbi::RustCall => Abi::RustCall,
-            ExternAbi::Unadjusted => Abi::Unadjusted,
+            ExternAbi::LlvmIntrinsic => Abi::LlvmIntrinsic,
             ExternAbi::RustCold => Abi::RustCold,
             ExternAbi::RustPreserveNone => Abi::RustPreserveNone,
             ExternAbi::RustTail => Abi::RustTail,
@@ -1069,9 +1078,14 @@ impl<'tcx> Stable<'tcx> for ty::AssocKind {
         tables: &mut Tables<'cx, BridgeTys>,
         cx: &CompilerCtxt<'cx, BridgeTys>,
     ) -> Self::T {
-        use crate::ty::{AssocKind, AssocTypeData};
+        use crate::ty::{AssocConstData, AssocKind, AssocTypeData};
         match *self {
-            ty::AssocKind::Const { name, .. } => AssocKind::Const { name: name.to_string() },
+            ty::AssocKind::Const { data, .. } => AssocKind::Const {
+                data: match data {
+                    ty::AssocConstData::Named(name) => AssocConstData::Named(name.to_string()),
+                    ty::AssocConstData::Anonymous => AssocConstData::Anonymous,
+                },
+            },
             ty::AssocKind::Fn { name, has_self } => {
                 AssocKind::Fn { name: name.to_string(), has_self }
             }

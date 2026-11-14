@@ -1,5 +1,6 @@
 use rustc_middle::mir::{self, NonDivergingIntrinsic};
-use rustc_middle::{bug, span_bug, ty};
+use rustc_middle::ty;
+use rustc_span::{bug, span_bug};
 use tracing::instrument;
 
 use super::{FunctionCx, LocalRef};
@@ -107,7 +108,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 let elem_size = pointee_layout.layout.size().bytes();
                 let bytes = bx.unchecked_sumul(count, bx.const_usize(elem_size));
 
-                let align = pointee_layout.layout.align.abi;
+                let align = pointee_layout.layout.align;
                 let dst = dst_val.immediate();
                 let src = src_val.immediate();
 

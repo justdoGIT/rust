@@ -85,6 +85,7 @@
 //!     column:
 //!     addr_of:
 //!     offset_of:
+//!     cfg:
 
 #![rustc_coherence_is_core]
 #![feature(lang_items)]
@@ -670,7 +671,11 @@ pub mod ops {
     // region:drop
     #[lang = "drop"]
     pub trait Drop {
-        fn drop(&mut self);
+        fn drop(&mut self) {
+            // region:pin
+            Drop::pin_drop(crate::pin::Pin::new(self))
+            // endregion:pin
+        }
 
         // region:pin
         fn pin_drop(self: crate::pin::Pin<&mut Self>) {}
@@ -1792,6 +1797,13 @@ pub mod async_iter {
 
         fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>>;
     }
+
+    impl<T> Poll<Option<T>> {
+        #[lang = "AsyncGenReady"]
+        pub fn async_gen_ready(t: T) -> Self {
+            Poll::Ready(Some(t))
+        }
+    }
 }
 // endregion:async_iterator
 
@@ -2271,6 +2283,16 @@ mod macros {
     }
     // endregion:include_bytes
 
+    // region:cfg
+    #[rustc_builtin_macro]
+    #[macro_export]
+    macro_rules! cfg {
+        ($($cfg:tt)*) => {
+            /* compiler built-in */
+        };
+    }
+    // endregion:cfg
+
     // region:concat
     #[rustc_builtin_macro]
     #[macro_export]
@@ -2493,6 +2515,7 @@ pub mod prelude {
             include_bytes,                                // :include_bytes
             concat,                                       // :concat
             env, option_env,                              // :env
+            cfg,                                          // :cfg
             matches,                                      // :matches
         };
     }

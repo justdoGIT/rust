@@ -35,7 +35,7 @@ use crate::{
     },
 };
 
-use super::{Expectation, InferenceContext};
+use super::{Expectation, InferenceContext, unify::UseSubtyping};
 
 #[derive(Debug)]
 struct ClosureSignatures<'db> {
@@ -273,9 +273,9 @@ impl<'db> InferenceContext<'db> {
                 // coroutine. To do so, we use the `CoroutineClosureSignature` to compute
                 // the coroutine type, filling in the tupled_upvars_ty and kind_ty with infer
                 // vars which will get constrained during upvar analysis.
-                let coroutine_output_ty = closure_args
-                    .coroutine_closure_sig()
-                    .map_bound(|sig| {
+                let coroutine_output_ty = interner.liberate_late_bound_regions(
+                    self.owner.into(),
+                    closure_args.coroutine_closure_sig().map_bound(|sig| {
                         sig.to_coroutine(
                             interner,
                             parent_args.as_slice(),
@@ -283,8 +283,8 @@ impl<'db> InferenceContext<'db> {
                             interner.coroutine_for_closure(coroutine_closure_id.into()),
                             coroutine_upvars_ty,
                         )
-                    })
-                    .skip_binder();
+                    }),
+                );
                 liberated_sig = interner.mk_fn_sig(
                     liberated_sig.inputs().iter().copied(),
                     coroutine_output_ty,
@@ -400,7 +400,10 @@ impl<'db> InferenceContext<'db> {
                     closure_expr,
                     Ty::new_var(self.interner(), self.table.infer_ctxt.root_var(vid)),
                     closure_kind,
-                    self.table.obligations_for_self_ty(vid).into_iter().map(|obl| obl.predicate),
+                    self.table
+                        .obligations_for_self_ty(vid, UseSubtyping::No)
+                        .into_iter()
+                        .map(|obl| obl.predicate),
                 ),
             TyKind::FnPtr(sig_tys, hdr) => match closure_kind {
                 ClosureKind::Closure => {
@@ -663,7 +666,7 @@ impl<'db> InferenceContext<'db> {
 
         // FIXME: We may want to elaborate here, though I assume this will be exceedingly rare.
         let mut return_ty = None;
-        for bound in self.table.obligations_for_self_ty(return_vid) {
+        for bound in self.table.obligations_for_self_ty(return_vid, UseSubtyping::No) {
             if let PredicateKind::Clause(ClauseKind::Projection(ret_projection)) =
                 bound.predicate.kind().skip_binder()
                 && let ret_projection = bound.predicate.kind().rebind(ret_projection)
@@ -967,7 +970,7 @@ impl<'db> InferenceContext<'db> {
         let interner = self.interner();
 
         let supplied_return = match decl_output {
-            Some(output) => self.make_body_ty(output),
+            Some(output) => self.make_ty(output),
             None => match closure_kind {
                 // In the case of the async block that we create for a function body,
                 // we expect the return type of the block to match that of the enclosing
@@ -1005,7 +1008,7 @@ impl<'db> InferenceContext<'db> {
         };
         // First, convert the types that the user supplied (if any).
         let supplied_arguments = decl_inputs.iter().map(|&input| match input {
-            Some(input) => self.make_body_ty(input),
+            Some(input) => self.make_ty(input),
             None => self.table.next_ty_var(closure_expr.into()),
         });
 
@@ -1054,7 +1057,7 @@ impl<'db> InferenceContext<'db> {
         let output_ty = match ret_ty.kind() {
             TyKind::Infer(InferTy::TyVar(ret_vid)) => self
                 .table
-                .obligations_for_self_ty(ret_vid)
+                .obligations_for_self_ty(ret_vid, UseSubtyping::No)
                 .into_iter()
                 .find_map(|obligation| get_future_output(obligation.predicate))?,
             TyKind::Alias(AliasTy { kind: AliasTyKind::Projection { .. }, .. }) => {
@@ -1134,11 +1137,11 @@ impl<'db> InferenceContext<'db> {
         let err_ty = Ty::new_error(interner, ErrorGuaranteed);
 
         if let Some(output) = decl_output {
-            self.make_body_ty(output);
+            self.make_ty(output);
         }
         let supplied_arguments = decl_inputs.iter().map(|&input| match input {
             Some(input) => {
-                self.make_body_ty(input);
+                self.make_ty(input);
                 err_ty
             }
             None => err_ty,

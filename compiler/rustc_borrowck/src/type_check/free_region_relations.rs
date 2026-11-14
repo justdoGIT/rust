@@ -11,7 +11,7 @@ use rustc_infer::traits::query::MirBorrowckImpliedOutlivesBounds;
 use rustc_infer::traits::query::type_op::Normalize;
 use rustc_middle::mir::ConstraintCategory;
 use rustc_middle::traits::query::OutlivesBound;
-use rustc_middle::ty::{self, RegionVid, Ty, TypeVisitableExt};
+use rustc_middle::ty::{self, CallerBoundsIterator, RegionVid, Ty, TypeVisitableExt};
 use rustc_span::{ErrorGuaranteed, Span};
 use rustc_trait_selection::solve::NoSolution;
 use rustc_trait_selection::traits::query::type_op;
@@ -211,7 +211,7 @@ impl<'tcx> UniversalRegionRelationsBuilder<'_, 'tcx> {
         // Normalize the assumptions we use to borrowck the program.
         let mut constraints = vec![];
         let mut known_type_outlives_obligations = vec![];
-        for bound in param_env.caller_bounds() {
+        for bound in param_env.caller_bounds().non_trait_clauses().iter() {
             if let Some(outlives) = bound.as_type_outlives_clause() {
                 known_type_outlives_obligations.push(outlives);
             };
@@ -296,8 +296,7 @@ impl<'tcx> UniversalRegionRelationsBuilder<'_, 'tcx> {
         // - We must compute the normalized signature and then compute implied bounds from that
         //   in order to connect any unconstrained region vars created during normalization to
         //   the types of the locals corresponding to the inputs and outputs of the item. (#136547)
-        if matches!(tcx.def_kind(defining_ty_def_id), DefKind::AssocFn | DefKind::AssocConst { .. })
-        {
+        if matches!(tcx.def_kind(defining_ty_def_id), DefKind::AssocFn | DefKind::AssocConst) {
             for &(ty, _) in tcx.assumed_wf_types(tcx.local_parent(defining_ty_def_id)) {
                 let result: Result<_, ErrorGuaranteed> = self
                     .infcx
@@ -372,7 +371,7 @@ impl<'tcx> UniversalRegionRelationsBuilder<'_, 'tcx> {
         // Normalize the assumptions we use to borrowck the program.
         let mut constraints = vec![];
         let mut known_type_outlives_obligations = vec![];
-        for bound in param_env.caller_bounds() {
+        for bound in param_env.caller_bounds().non_trait_clauses().iter() {
             if let Some(outlives) = bound.as_type_outlives_clause() {
                 known_type_outlives_obligations.push(outlives);
             };

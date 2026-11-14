@@ -8,7 +8,7 @@ use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{self, Command, Stdio};
+use std::process::{self, Command, ExitCode, Stdio};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,12 +18,12 @@ use std::{panic, str};
 pub(crate) use make::{BuildDocTestBuilder, DocTestBuilder};
 pub(crate) use markdown::test as test_markdown;
 use proc_macro2::{TokenStream, TokenTree};
+use rustc_attr_ir::{Attribute, AttributeKind};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxHasher, FxIndexMap, FxIndexSet};
 use rustc_errors::emitter::HumanReadableErrorType;
 use rustc_errors::{ColorConfig, DiagCtxtHandle};
-use rustc_hir::attrs::AttributeKind;
+use rustc_hir::CRATE_HIR_ID;
 use rustc_hir::def_id::LOCAL_CRATE;
-use rustc_hir::{Attribute, CRATE_HIR_ID};
 use rustc_interface::interface;
 use rustc_lint as lint;
 use rustc_middle::ty::TyCtxt;
@@ -37,7 +37,7 @@ use tracing::{debug, info};
 
 use self::rust::HirCollector;
 use crate::config::{MergeDoctests, Options as RustdocOptions, OutputFormat};
-use crate::html::markdown::{CodeLineMapping, ErrorCodes, Ignore, LangString, MdRelLine};
+use crate::html::markdown::{CodeBlockPosition, CodeLineMapping, ErrorCodes, Ignore, LangString};
 use crate::lint::init_lints;
 
 /// Type used to display times (compilation and total) information for merged doctests.
@@ -103,6 +103,13 @@ pub(crate) fn generate_args_file(file_path: &Path, options: &RustdocOptions) -> 
         content.push(format!("--check-cfg={check_cfg}"));
     }
 
+    for prefix in &options.remap_path_prefix_strs {
+        content.push(format!("--remap-path-prefix={prefix}"));
+    }
+    if let Some(scope) = &options.remap_path_scope_str {
+        content.push(format!("--remap-path-scope={scope}"));
+    }
+
     for lib_str in &options.lib_strs {
         content.push(format!("-L{lib_str}"));
     }
@@ -135,7 +142,7 @@ fn get_doctest_dir(opts: &RustdocOptions) -> io::Result<TempDir> {
     builder.tempdir()
 }
 
-pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions) {
+pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions) -> ExitCode {
     let invalid_codeblock_attributes_name = crate::lint::INVALID_CODEBLOCK_ATTRIBUTES.name;
 
     // See core::create_config for what's going on here.
@@ -166,7 +173,7 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
         lint_cap: Some(options.lint_cap.unwrap_or(lint::Forbid)),
         cg: options.codegen_options.clone(),
         externs: options.externs.clone(),
-        unstable_features: options.unstable_features,
+        unstable_features: options.unstable_features.clone(),
         actually_rustdoc: true,
         edition: options.edition,
         target_triple: options.target.clone(),
@@ -176,6 +183,7 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
         unstable_opts: options.unstable_opts.clone(),
         error_format: options.error_format.clone(),
         target_modifiers: options.target_modifiers.clone(),
+        describe_lints: options.describe_lints,
         ..config::Options::default()
     };
 
@@ -208,15 +216,24 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
         .map_err(|error| format!("failed to create temporary directory: {error:?}"))
     {
         Ok(temp_dir) => temp_dir,
-        Err(error) => return crate::wrap_return(dcx, Err(error)),
+        Err(error) => dcx.fatal(error),
     };
     let args_path = temp_dir.path().join("rustdoc-cfgs");
     crate::wrap_return(dcx, generate_args_file(&args_path, &options));
 
     let extract_doctests = options.output_format == OutputFormat::Doctest;
     let save_temps = options.codegen_options.save_temps;
+    let registered_lints = config.register_lints.is_some();
     let result = interface::run_compiler(config, |compiler| {
-        let krate = rustc_interface::passes::parse(&compiler.sess);
+        let sess = &compiler.sess;
+
+        // -W help
+        if sess.opts.describe_lints {
+            rustc_driver::describe_lints(sess, registered_lints);
+            return Ok(None);
+        }
+
+        let krate = rustc_interface::passes::parse(sess);
 
         let (collector, _incr_comp_session) =
             rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
@@ -264,7 +281,7 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
         ..
     } = match result {
         Ok(Some(collector)) => collector,
-        Ok(None) => return,
+        Ok(None) => return ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
             // Since some files in the temporary folder are still owned and alive, we need
@@ -272,19 +289,21 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
             if !save_temps {
                 let _ = std::fs::remove_dir_all(temp_dir.path());
             }
-            std::process::exit(1);
+            return ExitCode::FAILURE;
         }
     };
 
-    run_tests(
+    let exit_code = run_tests(
         dcx,
         opts,
         &rustdoc_options,
         &unused_extern_reports,
         standalone_tests,
         mergeable_tests,
-        Some(temp_dir),
     );
+    if exit_code != ExitCode::SUCCESS {
+        return exit_code;
+    }
 
     let compiling_test_count = compiling_test_count.load(Ordering::SeqCst);
 
@@ -326,6 +345,7 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
             eprintln!("{unused_extern_json}");
         }
     }
+    ExitCode::SUCCESS
 }
 
 pub(crate) fn run_tests(
@@ -335,9 +355,7 @@ pub(crate) fn run_tests(
     unused_extern_reports: &Arc<Mutex<Vec<UnusedExterns>>>,
     mut standalone_tests: Vec<test::TestDescAndFn>,
     mergeable_tests: FxIndexMap<MergeableTestKey, Vec<(DocTestBuilder, ScrapedDocTest)>>,
-    // We pass this argument so we can drop it manually before using `exit`.
-    mut temp_dir: Option<TempDir>,
-) {
+) -> ExitCode {
     let mut test_args = Vec::with_capacity(rustdoc_options.test_args.len() + 1);
     test_args.insert(0, "rustdoctest".to_string());
     test_args.extend_from_slice(&rustdoc_options.test_args);
@@ -413,27 +431,26 @@ pub(crate) fn run_tests(
     // `running 0 tests...`.
     if ran_edition_tests == 0 || !standalone_tests.is_empty() {
         standalone_tests.sort_by(|a, b| a.desc.name.as_slice().cmp(b.desc.name.as_slice()));
-        test::test_main_with_exit_callback(&test_args, standalone_tests, None, || {
-            let times = times.times_in_secs();
-            // We ensure temp dir destructor is called.
-            std::mem::drop(temp_dir.take());
-            if let Some((total_time, compilation_time)) = times {
-                test::print_merged_doctests_times(&test_args, total_time, compilation_time);
-            }
-        });
+        // We need a vector of `&TestDescAndFn`.
+        let standalone_test_refs = &standalone_tests.iter().collect::<Vec<_>>();
+        let exit = test::test_main(&test_args, standalone_test_refs);
+        let times = times.times_in_secs();
+        if let Some((total_time, compilation_time)) = times {
+            test::print_merged_doctests_times(&test_args, total_time, compilation_time);
+        }
+        // Fall through on success, the caller may want to do more stuff.
+        if exit != std::process::ExitCode::SUCCESS {
+            return exit;
+        }
     } else {
-        // If the first condition branch exited successfully, `test_main_with_exit_callback` will
+        // If the first condition branch exited successfully, it will
         // not exit the process. So to prevent displaying the times twice, we put it behind an
         // `else` condition.
         if let Some((total_time, compilation_time)) = times.times_in_secs() {
             test::print_merged_doctests_times(&test_args, total_time, compilation_time);
         }
     }
-    // We ensure temp dir destructor is called.
-    std::mem::drop(temp_dir);
-    if nb_errors != 0 {
-        std::process::exit(test::ERROR_EXIT_CODE);
-    }
+    if nb_errors != 0 { test::ERROR_EXIT_CODE.into() } else { ExitCode::SUCCESS }
 }
 
 // Look for `#![doc(test(no_crate_inject))]`, used by crates in the std facade.
@@ -547,19 +564,23 @@ fn wrapped_rustc_command(rustc_wrappers: &[PathBuf], rustc_binary: &Path) -> Com
 /// (if multiple doctests are merged), `main` function,
 /// and everything needed to calculate the compiler's command-line arguments.
 /// The `# ` prefix on boring lines has also been stripped.
-pub(crate) struct RunnableDocTest {
+pub(crate) struct RunnableDocTest<'a> {
+    /// In a merged test, this is the code for the "bundle" that contains the actual doctests.
+    /// In a standalone test this is just the regular test code.
     full_test_code: String,
     full_test_line_offset: usize,
     test_opts: IndividualTestOptions,
-    global_opts: GlobalTestOptions,
+    global_opts: &'a GlobalTestOptions,
     langstr: LangString,
     line: usize,
     edition: Edition,
     no_run: bool,
-    merged_test_code: Option<String>,
+    /// If `Some`, this is a merged test and the string is the code for the "runner" that contains
+    /// the test harness to invoke the doctests.
+    merged_test_runner_code: Option<String>,
 }
 
-impl RunnableDocTest {
+impl RunnableDocTest<'_> {
     fn path_for_merged_doctest_bundle(&self) -> PathBuf {
         self.test_opts.outdir.path().join(format!("doctest_bundle_{}.rs", self.edition))
     }
@@ -567,7 +588,7 @@ impl RunnableDocTest {
         self.test_opts.outdir.path().join(format!("doctest_runner_{}.rs", self.edition))
     }
     fn is_multiple_tests(&self) -> bool {
-        self.merged_test_code.is_some()
+        self.merged_test_runner_code.is_some()
     }
 }
 
@@ -578,7 +599,7 @@ impl RunnableDocTest {
 ///
 /// Returns a tuple containing the `Duration` of the compilation and the `Result` of the test.
 fn run_test(
-    doctest: RunnableDocTest,
+    doctest: RunnableDocTest<'_>,
     rustdoc_options: &RustdocOptions,
     supports_color: bool,
     report_unused_externs: impl Fn(UnusedExterns),
@@ -627,9 +648,12 @@ fn run_test(
         },
     ]);
     if let ErrorOutputType::HumanReadable { kind, color_config } = rustdoc_options.error_format {
-        let short = kind.short();
-        let unicode = kind == HumanReadableErrorType { unicode: true, short };
+        let HumanReadableErrorType { no_graphics, short, unicode } = kind;
 
+        if no_graphics {
+            compiler_args
+                .extend_from_slice(&["--error-format".to_owned(), "human-no-graphics".to_owned()]);
+        }
         if short {
             compiler_args.extend_from_slice(&["--error-format".to_owned(), "short".to_owned()]);
         }
@@ -706,7 +730,7 @@ fn run_test(
             return (Duration::default(), Err(TestFailure::CompileError));
         }
     };
-    let output = if let Some(merged_test_code) = &doctest.merged_test_code {
+    let output = if let Some(merged_test_runner_code) = &doctest.merged_test_runner_code {
         // compile-fail tests never get merged, so this should always pass
         let status = child.wait().expect("Failed to wait");
 
@@ -751,7 +775,7 @@ fn run_test(
         extern_path.push(&output_bundle_file);
         runner_compiler.arg(extern_path);
         runner_compiler.arg(&runner_input_file);
-        if std::fs::write(&runner_input_file, merged_test_code).is_err() {
+        if std::fs::write(&runner_input_file, merged_test_runner_code).is_err() {
             // If we cannot write this file for any reason, we leave. All combined tests will be
             // tested as standalone tests.
             return (instant.elapsed(), Err(TestFailure::CompileError));
@@ -966,7 +990,7 @@ impl ScrapedDocTest {
         }
         let name = format!(
             "{} - {item_path}(line {line})",
-            filename.display(RemapPathScopeComponents::DOCUMENTATION)
+            filename.display(RemapPathScopeComponents::DIAGNOSTICS)
         );
 
         Self { filename, line, langstr, text, name, span, code_mappings, global_crate_attrs }
@@ -979,13 +1003,12 @@ impl ScrapedDocTest {
         self.langstr.no_run || opts.no_run
     }
 
-    fn path(&self) -> PathBuf {
-        match &self.filename {
-            FileName::Real(name) => {
-                name.path(RemapPathScopeComponents::DOCUMENTATION).to_path_buf()
-            }
-            _ => PathBuf::from(r"doctest.rs"),
-        }
+    fn path(&self, scope: RemapPathScopeComponents) -> String {
+        self.filename.display(scope).to_string()
+    }
+
+    fn local_path(&self) -> PathBuf {
+        self.filename.clone().into_local_path().unwrap_or_else(|| PathBuf::from(r"doctest.rs"))
     }
 }
 
@@ -994,7 +1017,7 @@ pub(crate) trait DocTestVisitor {
         &mut self,
         test: String,
         config: LangString,
-        rel_line: MdRelLine,
+        position: CodeBlockPosition,
         code_mappings: Vec<CodeLineMapping>,
     );
     fn visit_header(&mut self, _name: &str, _level: u32) {}
@@ -1117,8 +1140,6 @@ fn generate_test_desc_and_fn(
     unused_externs: Arc<Mutex<Vec<UnusedExterns>>>,
 ) -> test::TestDescAndFn {
     let target_str = rustdoc_options.target.to_string();
-    let rustdoc_test_options =
-        IndividualTestOptions::new(&rustdoc_options, &test.test_id, scraped_test.path());
 
     debug!("creating test {}: {}", scraped_test.name, scraped_test.text);
     test::TestDescAndFn {
@@ -1141,14 +1162,19 @@ fn generate_test_desc_and_fn(
             no_run: scraped_test.no_run(&rustdoc_options),
             test_type: test::TestType::DocTest,
         },
-        testfn: test::DynTestFn(Box::new(move || {
+        testfn: test::DynTestFn(Arc::new(move || {
+            let rustdoc_test_options = IndividualTestOptions::new(
+                &rustdoc_options,
+                &test.test_id,
+                scraped_test.local_path(),
+            );
             doctest_run_fn(
                 rustdoc_test_options,
-                opts,
-                test,
-                scraped_test,
-                rustdoc_options,
-                unused_externs,
+                &opts,
+                &test,
+                &scraped_test,
+                &rustdoc_options,
+                &unused_externs,
             )
         })),
     }
@@ -1156,11 +1182,11 @@ fn generate_test_desc_and_fn(
 
 fn doctest_run_fn(
     test_opts: IndividualTestOptions,
-    global_opts: GlobalTestOptions,
-    doctest: DocTestBuilder,
-    scraped_test: ScrapedDocTest,
-    rustdoc_options: Arc<RustdocOptions>,
-    unused_externs: Arc<Mutex<Vec<UnusedExterns>>>,
+    global_opts: &GlobalTestOptions,
+    doctest: &DocTestBuilder,
+    scraped_test: &ScrapedDocTest,
+    rustdoc_options: &RustdocOptions,
+    unused_externs: &Mutex<Vec<UnusedExterns>>,
 ) -> Result<(), String> {
     let report_unused_externs = |uext| {
         unused_externs.lock().unwrap().push(uext);
@@ -1180,7 +1206,7 @@ fn doctest_run_fn(
         line: scraped_test.line,
         edition: scraped_test.edition(&rustdoc_options),
         no_run: scraped_test.no_run(&rustdoc_options),
-        merged_test_code: None,
+        merged_test_runner_code: None,
     };
     let (_, res) =
         run_test(runnable_test, &rustdoc_options, doctest.supports_color, report_unused_externs);
@@ -1245,10 +1271,14 @@ impl DocTestVisitor for Vec<usize> {
         &mut self,
         _test: String,
         _config: LangString,
-        rel_line: MdRelLine,
+        position: CodeBlockPosition,
         _code_mappings: Vec<CodeLineMapping>,
     ) {
-        self.push(1 + rel_line.offset());
+        let line = match position {
+            CodeBlockPosition::Relative(rel_line) => 1 + rel_line.offset(),
+            CodeBlockPosition::Span(_) => unreachable!(),
+        };
+        self.push(line);
     }
 }
 

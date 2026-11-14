@@ -1,5 +1,4 @@
 //@ revisions: OPT0 OPT0_S390X
-//@ min-llvm-version: 22
 //@ [OPT0] ignore-s390x
 //@ [OPT0_S390X] only-s390x
 //@ [OPT0] compile-flags: -C no-prepopulate-passes -Copt-level=0
@@ -8,7 +7,6 @@
 // This test checks that constants of SIMD type are passed as immediate vectors.
 // We ensure that both vector representations (struct with fields and struct wrapping array) work.
 #![crate_type = "lib"]
-#![feature(abi_unadjusted)]
 #![feature(const_trait_impl)]
 #![feature(link_llvm_intrinsics)]
 #![feature(repr_simd)]
@@ -26,7 +24,7 @@ use minisimd::{PackedSimd, Simd, f32x2, i8x2};
 // The following functions are required for the tests to ensure
 // that they are called with a const vector
 
-extern "unadjusted" {
+extern "llvm-intrinsic" {
     #[link_name = "llvm.vector.reduce.add.v2i8"]
     fn test_i8x2(a: i8x2) -> i8;
     #[link_name = "llvm.vector.partial.reduce.add.v2i8.v2i8.v2i8"]

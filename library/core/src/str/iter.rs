@@ -3,18 +3,18 @@
 use super::pattern::{DoubleEndedSearcher, Pattern, ReverseSearcher, Searcher};
 use super::validations::{next_code_point, next_code_point_reverse};
 use super::{
-    BytesIsNotEmpty, CharEscapeDebugContinue, CharEscapeDefault, CharEscapeUnicode,
-    IsAsciiWhitespace, IsNotEmpty, IsWhitespace, LinesMap, UnsafeBytesToStr, from_utf8_unchecked,
+    BytesIsNotEmpty, CharEscapeDebug, CharEscapeDefault, CharEscapeUnicode, IsAsciiWhitespace,
+    IsNotEmpty, IsWhitespace, LinesMap, UnsafeBytesToStr, from_utf8_unchecked,
 };
+use crate::char as char_mod;
 use crate::fmt::{self, Write};
 use crate::iter::{
-    Chain, Copied, Filter, FlatMap, Flatten, FusedIterator, Map, TrustedLen, TrustedRandomAccess,
+    Copied, Filter, FlatMap, FusedIterator, Map, TrustedLen, TrustedRandomAccess,
     TrustedRandomAccessNoCoerce,
 };
 use crate::num::NonZero;
 use crate::ops::Try;
 use crate::slice::{self, Split as SliceSplit};
-use crate::{char as char_mod, option};
 
 /// An iterator over the [`char`]s of a string slice.
 ///
@@ -661,7 +661,9 @@ impl<'a, P: Pattern> SplitInternal<'a, P> {
 
         let haystack = self.matcher.haystack();
         match self.matcher.next_match() {
-            // SAFETY: `Searcher` guarantees that `a` and `b` lie on unicode boundaries.
+            // SAFETY: `Searcher` guarantees that:
+            // - `a` and `b` lie on unicode boundaries.
+            // - `a <= b <= haystack().len()` is satisfied.
             Some((a, b)) => unsafe {
                 let elt = haystack.get_unchecked(self.start..a);
                 self.start = b;
@@ -679,9 +681,11 @@ impl<'a, P: Pattern> SplitInternal<'a, P> {
 
         let haystack = self.matcher.haystack();
         match self.matcher.next_match() {
-            // SAFETY: `Searcher` guarantees that `b` lies on unicode boundary,
-            // and self.start is either the start of the original string,
+            // SAFETY: `Searcher` guarantees that:
+            // - `b` lies on unicode boundary.
+            // - `self.start` is either the start of the original string,
             // or `b` was assigned to it, so it also lies on unicode boundary.
+            // - `self.start <= b <= haystack().len()` is satisfied.
             Some((_, b)) => unsafe {
                 let elt = haystack.get_unchecked(self.start..b);
                 self.start = b;
@@ -714,7 +718,11 @@ impl<'a, P: Pattern> SplitInternal<'a, P> {
 
         let haystack = self.matcher.haystack();
         match self.matcher.next_match_back() {
-            // SAFETY: `Searcher` guarantees that `a` and `b` lie on unicode boundaries.
+            // SAFETY: `Searcher` guarantees that:
+            // - `a` and `b` lie on unicode boundaries.
+            // - `self.end` is either the end of the original string,
+            // or `a` was assigned to it, so it also lies on unicode boundary.
+            // - `a <= b <= haystack().len()` is satisfied.
             Some((a, b)) => unsafe {
                 let elt = haystack.get_unchecked(b..self.end);
                 self.end = a;
@@ -751,9 +759,11 @@ impl<'a, P: Pattern> SplitInternal<'a, P> {
 
         let haystack = self.matcher.haystack();
         match self.matcher.next_match_back() {
-            // SAFETY: `Searcher` guarantees that `b` lies on unicode boundary,
-            // and self.end is either the end of the original string,
+            // SAFETY: `Searcher` guarantees that:
+            // - `b` lies on unicode boundary.
+            // - self.end is either the end of the original string,
             // or `b` was assigned to it, so it also lies on unicode boundary.
+            // - `self.end <= b <= haystack.len()` is satisfied.
             Some((_, b)) => unsafe {
                 let elt = haystack.get_unchecked(b..self.end);
                 self.end = b;
@@ -1284,7 +1294,7 @@ pub struct SplitAsciiWhitespace<'a> {
 }
 
 /// An iterator over the substrings of a string,
-/// terminated by a substring matching to a predicate function
+/// terminated by a substring matching to a predicate function.
 /// Unlike `Split`, it contains the matched part as a terminator
 /// of the subslice.
 ///
@@ -1579,10 +1589,7 @@ impl FusedIterator for EncodeUtf16<'_> {}
 #[stable(feature = "str_escape", since = "1.34.0")]
 #[derive(Clone, Debug)]
 pub struct EscapeDebug<'a> {
-    pub(super) inner: Chain<
-        Flatten<option::IntoIter<char_mod::EscapeDebug>>,
-        FlatMap<Chars<'a>, char_mod::EscapeDebug, CharEscapeDebugContinue>,
-    >,
+    pub(super) inner: FlatMap<Chars<'a>, char_mod::EscapeDebug, CharEscapeDebug>,
 }
 
 /// The return type of [`str::escape_default`].
@@ -1590,6 +1597,18 @@ pub struct EscapeDebug<'a> {
 #[derive(Clone, Debug)]
 pub struct EscapeDefault<'a> {
     pub(super) inner: FlatMap<Chars<'a>, char_mod::EscapeDefault, CharEscapeDefault>,
+}
+
+impl<'a> EscapeDefault<'a> {
+    /// Disassembles the iterator into its internal state.
+    /// Used by alloc for an optimized to_string impl.
+    #[unstable(feature = "std_internals", issue = "none")]
+    pub fn into_parts(
+        self,
+    ) -> (Option<impl Iterator<Item = char>>, Option<Chars<'a>>, Option<impl Iterator<Item = char>>)
+    {
+        self.inner.into_parts()
+    }
 }
 
 /// The return type of [`str::escape_unicode`].

@@ -4,8 +4,9 @@ use clippy_utils::res::{MaybeDef as _, MaybeResPath as _};
 use clippy_utils::source::{snippet_opt, snippet_with_applicability};
 use clippy_utils::usage::{local_used_after_expr, local_used_in};
 use clippy_utils::{get_path_from_caller_to_method_type, is_adjusted, is_no_std_crate};
+use rustc_attr_ir::find_attr;
 use rustc_errors::Applicability;
-use rustc_hir::{BindingMode, Expr, ExprKind, FnRetTy, GenericArgs, Param, PatKind, QPath, Safety, TyKind, find_attr};
+use rustc_hir::{BindingMode, Expr, ExprKind, FnRetTy, GenericArgs, Param, PatKind, QPath, Safety, TyKind};
 use rustc_infer::infer::TyCtxtInferExt as _;
 use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
 use rustc_middle::ty::adjustment::{Adjust, DerefAdjustKind};
@@ -354,7 +355,7 @@ fn has_late_bound_to_non_late_bound_regions(from_sig: FnSig<'_>, to_sig: FnSig<'
 
     fn check_ty(from_ty: Ty<'_>, to_ty: Ty<'_>) -> bool {
         match (from_ty.kind(), to_ty.kind()) {
-            (&ty::Adt(_, from_subs), &ty::Adt(_, to_subs)) => check_subs(from_subs, to_subs),
+            (&ty::Adt(_, from_subs), &ty::Adt(_, to_subs)) => check_subs(from_subs.as_slice(), to_subs.as_slice()),
             (&ty::Array(from_ty, _), &ty::Array(to_ty, _)) | (&ty::Slice(from_ty), &ty::Slice(to_ty)) => {
                 check_ty(from_ty, to_ty)
             },

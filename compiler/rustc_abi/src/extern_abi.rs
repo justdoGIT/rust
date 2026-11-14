@@ -54,9 +54,8 @@ pub enum ExternAbi {
     /// This ABI is not stable, and relies on LLVM implementation details.
     RustTail,
 
-    /// Unstable impl detail that directly uses Rust types to describe the ABI to LLVM.
-    /// Even normally-compatible Rust types can become ABI-incompatible with this ABI!
-    Unadjusted,
+    /// Unstable ABI used to call LLVM intrinsics.
+    LlvmIntrinsic,
 
     /// An ABI that rustc does not know how to call or define. Functions with this ABI can
     /// only be created using `#[naked]` functions or `extern "custom"` blocks, and can only
@@ -196,6 +195,7 @@ abi_impls! {
             Fastcall { unwind: false } =><= "fastcall",
             Fastcall { unwind: true } =><= "fastcall-unwind",
             GpuKernel =><= "gpu-kernel",
+            LlvmIntrinsic =><= "llvm-intrinsic",
             Msp430Interrupt =><= "msp430-interrupt",
             PtxKernel =><= "ptx-kernel",
             RiscvInterruptM =><= "riscv-interrupt-m",
@@ -213,7 +213,6 @@ abi_impls! {
             RustTail =><= "tail",
             Thiscall { unwind: false } =><= "thiscall",
             Thiscall { unwind: true } =><= "thiscall-unwind",
-            Unadjusted =><= "unadjusted",
             Vectorcall { unwind: false } =><= "vectorcall",
             Vectorcall { unwind: true } =><= "vectorcall-unwind",
             Win64 { unwind: false } =><= "win64",
@@ -242,11 +241,25 @@ impl PartialEq for ExternAbi {
 
 impl Eq for ExternAbi {}
 
+impl ExternAbi {
+    /// Common implementation for `Hash` and `StableHash`.
+    fn stable_hash_inner(&self, hasher: &mut impl Hasher) {
+        // To avoid staging inconsistencies in stable hashing, we must not rely
+        // on any stdlib-provided or stdlib-derived impl of `Hash`.
+        // See <https://github.com/rust-lang/rust/issues/164734> for context.
+
+        // Hardcoded copy of the unstable `Hasher::write_str`, with an explicit terminator.
+        hasher.write(self.as_str().as_bytes());
+        hasher.write_u8(0xFF);
+
+        // double-assurance of a prefix breaker
+        hasher.write_u32(u32::from_be_bytes(*b"ABI\0"));
+    }
+}
+
 impl Hash for ExternAbi {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.as_str().hash(state);
-        // double-assurance of a prefix breaker
-        u32::from_be_bytes(*b"ABI\0").hash(state);
+        self.stable_hash_inner(state);
     }
 }
 
@@ -254,7 +267,7 @@ impl Hash for ExternAbi {
 impl StableHash for ExternAbi {
     #[inline]
     fn stable_hash<Hcx: StableHashCtxt>(&self, _: &mut Hcx, hasher: &mut StableHasher) {
-        Hash::hash(self, hasher);
+        self.stable_hash_inner(hasher);
     }
 }
 
@@ -355,7 +368,7 @@ impl ExternAbi {
             | Self::Rust
             | Self::RustCold
             | Self::RustInvalid
-            | Self::Unadjusted
+            | Self::LlvmIntrinsic
             | Self::EfiApi
             | Self::Aapcs { .. }
             | Self::Cdecl { .. }
@@ -368,6 +381,43 @@ impl ExternAbi {
             | Self::RustPreserveNone
             | Self::RustTail
             | Self::Swift => true,
+        }
+    }
+
+    /// Returns whether safe functions with this ABI implement the `Fn` traits.
+    /// `false` only for uncallable or internal ABIs.
+    pub fn is_fn_trait_compatible(self) -> bool {
+        match self {
+            ExternAbi::C { .. }
+            | ExternAbi::System { .. }
+            | ExternAbi::Rust
+            | ExternAbi::RustCold
+            | ExternAbi::RustPreserveNone
+            | ExternAbi::RustTail
+            | ExternAbi::EfiApi
+            | ExternAbi::Swift
+            | ExternAbi::Aapcs { .. }
+            | ExternAbi::CmseNonSecureCall
+            | ExternAbi::CmseNonSecureEntry
+            | ExternAbi::Cdecl { .. }
+            | ExternAbi::Stdcall { .. }
+            | ExternAbi::Fastcall { .. }
+            | ExternAbi::Thiscall { .. }
+            | ExternAbi::Vectorcall { .. }
+            | ExternAbi::SysV64 { .. }
+            | ExternAbi::Win64 { .. } => true,
+            ExternAbi::RustCall
+            | ExternAbi::RustInvalid
+            | ExternAbi::LlvmIntrinsic
+            | ExternAbi::Custom
+            | ExternAbi::GpuKernel
+            | ExternAbi::PtxKernel
+            | ExternAbi::AvrInterrupt
+            | ExternAbi::AvrNonBlockingInterrupt
+            | ExternAbi::Msp430Interrupt
+            | ExternAbi::RiscvInterruptM
+            | ExternAbi::RiscvInterruptS
+            | ExternAbi::X86Interrupt => false,
         }
     }
 }

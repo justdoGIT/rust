@@ -208,6 +208,8 @@ mod int_to_float {
 
 // Conversions from unsigned integers to floats.
 intrinsics! {
+    /* u32 -> fN */
+
     #[arm_aeabi_alias = __aeabi_ui2f]
     pub extern "C" fn __floatunsisf(i: u32) -> f32 {
         f32::from_bits(int_to_float::u32_to_f32_bits(i))
@@ -218,6 +220,14 @@ intrinsics! {
         f64::from_bits(int_to_float::u32_to_f64_bits(i))
     }
 
+    #[ppc_name = __floatunsikf]
+    #[cfg(f128_enabled)]
+    pub extern "C" fn __floatunsitf(i: u32) -> f128 {
+        f128::from_bits(int_to_float::u32_to_f128_bits(i))
+    }
+
+    /* u64 -> fN */
+
     #[arm_aeabi_alias = __aeabi_ul2f]
     pub extern "C" fn __floatundisf(i: u64) -> f32 {
         f32::from_bits(int_to_float::u64_to_f32_bits(i))
@@ -227,6 +237,14 @@ intrinsics! {
     pub extern "C" fn __floatundidf(i: u64) -> f64 {
         f64::from_bits(int_to_float::u64_to_f64_bits(i))
     }
+
+    #[ppc_name = __floatundikf]
+    #[cfg(f128_enabled)]
+    pub extern "C" fn __floatunditf(i: u64) -> f128 {
+        f128::from_bits(int_to_float::u64_to_f128_bits(i))
+    }
+
+    /* u128 -> fN */
 
     #[cfg(not(all(target_os = "uefi", target_arch = "x86_64")))]
     pub extern "C" fn __floatuntisf(i: u128) -> f32 {
@@ -248,19 +266,7 @@ intrinsics! {
         f64::from_bits(int_to_float::u128_to_f64_bits((u128::from(hi) << 64) | u128::from(lo)))
     }
 
-    #[ppc_alias = __floatunsikf]
-    #[cfg(f128_enabled)]
-    pub extern "C" fn __floatunsitf(i: u32) -> f128 {
-        f128::from_bits(int_to_float::u32_to_f128_bits(i))
-    }
-
-    #[ppc_alias = __floatundikf]
-    #[cfg(f128_enabled)]
-    pub extern "C" fn __floatunditf(i: u64) -> f128 {
-        f128::from_bits(int_to_float::u64_to_f128_bits(i))
-    }
-
-    #[ppc_alias = __floatuntikf]
+    #[ppc_name = __floatuntikf]
     #[cfg(f128_enabled)]
     pub extern "C" fn __floatuntitf(i: u128) -> f128 {
         f128::from_bits(int_to_float::u128_to_f128_bits(i))
@@ -269,6 +275,8 @@ intrinsics! {
 
 // Conversions from signed integers to floats.
 intrinsics! {
+    /* i32 -> fN */
+
     #[arm_aeabi_alias = __aeabi_i2f]
     pub extern "C" fn __floatsisf(i: i32) -> f32 {
         int_to_float::signed(i, int_to_float::u32_to_f32_bits)
@@ -279,6 +287,14 @@ intrinsics! {
         int_to_float::signed(i, int_to_float::u32_to_f64_bits)
     }
 
+    #[ppc_name = __floatsikf]
+    #[cfg(f128_enabled)]
+    pub extern "C" fn __floatsitf(i: i32) -> f128 {
+        int_to_float::signed(i, int_to_float::u32_to_f128_bits)
+    }
+
+    /* i64 -> fN */
+
     #[arm_aeabi_alias = __aeabi_l2f]
     pub extern "C" fn __floatdisf(i: i64) -> f32 {
         int_to_float::signed(i, int_to_float::u64_to_f32_bits)
@@ -288,6 +304,14 @@ intrinsics! {
     pub extern "C" fn __floatdidf(i: i64) -> f64 {
         int_to_float::signed(i, int_to_float::u64_to_f64_bits)
     }
+
+    #[ppc_name = __floatdikf]
+    #[cfg(f128_enabled)]
+    pub extern "C" fn __floatditf(i: i64) -> f128 {
+        int_to_float::signed(i, int_to_float::u64_to_f128_bits)
+    }
+
+    /* i128 -> fN */
 
     #[cfg(not(all(target_os = "uefi", target_arch = "x86_64")))]
     pub extern "C" fn __floattisf(i: i128) -> f32 {
@@ -309,19 +333,7 @@ intrinsics! {
         int_to_float::signed((i128::from(hi) << 64) | i128::from(lo), int_to_float::u128_to_f64_bits)
     }
 
-    #[ppc_alias = __floatsikf]
-    #[cfg(f128_enabled)]
-    pub extern "C" fn __floatsitf(i: i32) -> f128 {
-        int_to_float::signed(i, int_to_float::u32_to_f128_bits)
-    }
-
-    #[ppc_alias = __floatdikf]
-    #[cfg(f128_enabled)]
-    pub extern "C" fn __floatditf(i: i64) -> f128 {
-        int_to_float::signed(i, int_to_float::u64_to_f128_bits)
-    }
-
-    #[ppc_alias = __floattikf]
+    #[ppc_name = __floattikf]
     #[cfg(f128_enabled)]
     pub extern "C" fn __floattitf(i: i128) -> f128 {
         int_to_float::signed(i, int_to_float::u128_to_f128_bits)
@@ -411,6 +423,8 @@ where
 
 // Conversions from floats to unsigned integers.
 intrinsics! {
+    /* f32 -> uN */
+
     #[arm_aeabi_alias = __aeabi_f2uiz]
     pub extern "C" fn __fixunssfsi(f: f32) -> u32 {
         float_to_unsigned_int(f)
@@ -424,6 +438,8 @@ intrinsics! {
     pub extern "C" fn __fixunssfti(f: f32) -> u128 {
         float_to_unsigned_int(f)
     }
+
+    /* f64 -> uN */
 
     #[arm_aeabi_alias = __aeabi_d2uiz]
     pub extern "C" fn __fixunsdfsi(f: f64) -> u32 {
@@ -439,19 +455,21 @@ intrinsics! {
         float_to_unsigned_int(f)
     }
 
-    #[ppc_alias = __fixunskfsi]
+    /* f128 -> uN */
+
+    #[ppc_name = __fixunskfsi]
     #[cfg(f128_enabled)]
     pub extern "C" fn __fixunstfsi(f: f128) -> u32 {
         float_to_unsigned_int(f)
     }
 
-    #[ppc_alias = __fixunskfdi]
+    #[ppc_name = __fixunskfdi]
     #[cfg(f128_enabled)]
     pub extern "C" fn __fixunstfdi(f: f128) -> u64 {
         float_to_unsigned_int(f)
     }
 
-    #[ppc_alias = __fixunskfti]
+    #[ppc_name = __fixunskfti]
     #[cfg(f128_enabled)]
     pub extern "C" fn __fixunstfti(f: f128) -> u128 {
         float_to_unsigned_int(f)
@@ -460,6 +478,8 @@ intrinsics! {
 
 // Conversions from floats to signed integers.
 intrinsics! {
+    /* f32 -> iN */
+
     #[arm_aeabi_alias = __aeabi_f2iz]
     pub extern "C" fn __fixsfsi(f: f32) -> i32 {
         float_to_signed_int(f)
@@ -473,6 +493,8 @@ intrinsics! {
     pub extern "C" fn __fixsfti(f: f32) -> i128 {
         float_to_signed_int(f)
     }
+
+    /* f64 -> iN */
 
     #[arm_aeabi_alias = __aeabi_d2iz]
     pub extern "C" fn __fixdfsi(f: f64) -> i32 {
@@ -488,19 +510,21 @@ intrinsics! {
         float_to_signed_int(f)
     }
 
-    #[ppc_alias = __fixkfsi]
+    /* f128 -> iN */
+
+    #[ppc_name = __fixkfsi]
     #[cfg(f128_enabled)]
     pub extern "C" fn __fixtfsi(f: f128) -> i32 {
         float_to_signed_int(f)
     }
 
-    #[ppc_alias = __fixkfdi]
+    #[ppc_name = __fixkfdi]
     #[cfg(f128_enabled)]
     pub extern "C" fn __fixtfdi(f: f128) -> i64 {
         float_to_signed_int(f)
     }
 
-    #[ppc_alias = __fixkfti]
+    #[ppc_name = __fixkfti]
     #[cfg(f128_enabled)]
     pub extern "C" fn __fixtfti(f: f128) -> i128 {
         float_to_signed_int(f)

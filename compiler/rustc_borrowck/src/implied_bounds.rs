@@ -40,7 +40,7 @@ pub(super) fn mir_borrowck_implied_outlives_bounds<'tcx>(
     // parent body, so for these we do want to define opaque types. Not doing so can result
     // in incorrect errors when normalizing implied bounds.
     let typing_env = if tcx.is_typeck_child(body_def_id.to_def_id()) {
-        TypingEnv::post_typeck_until_borrowck(tcx, body_def_id)
+        TypingEnv::post_typeck_through_borrowck(tcx, body_def_id)
     } else {
         TypingEnv::non_body_analysis(tcx, body_def_id)
     };
@@ -90,7 +90,7 @@ pub(super) fn mir_borrowck_implied_outlives_bounds<'tcx>(
     // - We must compute the normalized signature and then compute implied bounds from that
     //   in order to connect any unconstrained region vars created during normalization to
     //   the types of the locals corresponding to the inputs and outputs of the item. #136547
-    if matches!(tcx.def_kind(body_def_id), DefKind::AssocFn | DefKind::AssocConst { .. }) {
+    if matches!(tcx.def_kind(body_def_id), DefKind::AssocFn | DefKind::AssocConst) {
         for &(ty, _) in tcx.assumed_wf_types(tcx.local_parent(body_def_id)) {
             let normalized_ty = ocx
                 .deeply_normalize(

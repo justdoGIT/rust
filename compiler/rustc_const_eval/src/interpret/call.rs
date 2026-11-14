@@ -6,11 +6,12 @@ use std::borrow::Cow;
 
 use either::{Left, Right};
 use rustc_abi::{self as abi, ExternAbi, FieldIdx, Integer, VariantIdx};
+use rustc_attr_ir::find_attr;
 use rustc_hir::def_id::DefId;
-use rustc_hir::find_attr;
+use rustc_middle::mir;
 use rustc_middle::ty::layout::{IntegerExt, TyAndLayout};
-use rustc_middle::ty::{self, AdtDef, Instance, Ty, VariantDef};
-use rustc_middle::{bug, mir, span_bug};
+use rustc_middle::ty::{self, AdtDef, FieldDef, Instance, Ty, VariantDef};
+use rustc_span::{bug, span_bug};
 use rustc_target::callconv::{ArgAbi, FnAbi};
 use tracing::field::Empty;
 use tracing::{info, instrument, trace};
@@ -175,7 +176,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
 
         let all_fields_1zst = |variant: &VariantDef| -> InterpResult<'tcx, _> {
             for field in &variant.fields {
-                let ty = field.ty(*self.tcx, args).skip_norm_wip();
+                let ty = field.ty(*self.tcx, *args).skip_norm_wip();
                 let layout = self.layout_of(ty)?;
                 if !layout.is_1zst() {
                     return interp_ok(false);
@@ -201,7 +202,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             return interp_ok(layout);
         }
         let inner =
-            relevant_variant.fields[FieldIdx::from_u32(0)].ty(*self.tcx, args).skip_norm_wip();
+            relevant_variant.fields[FieldIdx::from_u32(0)].ty(*self.tcx, *args).skip_norm_wip();
         let inner = self.layout_of(inner)?;
 
         // Check if the inner type is one of the NPO-guaranteed ones.
@@ -229,6 +230,65 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         })
     }
 
+    /// Determine whether the given types are identical types from the perspective of C.
+    pub(super) fn identical_c_types(&self, caller_type: Ty<'tcx>, callee_type: Ty<'tcx>) -> bool {
+        if caller_type == callee_type {
+            return true;
+        }
+
+        // C considers two structs to be the same if they have the same name and the same
+        // fields. We need a similar rules that that e.g. if caller and callee use the "same"
+        // type from two different versions of the same crate, that call is accepted.
+        let ty::Adt(caller_adt, caller_args) = caller_type.kind() else { return false };
+        let ty::Adt(callee_adt, callee_args) = callee_type.kind() else { return false };
+
+        // We want to reject compatibility between structs with and without `#[cfi_encoding]` attr,
+        // see https://github.com/rust-lang/rust/pull/164739#discussion_r4360457828
+        #[derive(PartialEq, Eq)]
+        enum AbiNameClass {
+            CfiEncoded,
+            Normal,
+        }
+
+        let abi_name = |adt: AdtDef<'tcx>| {
+            find_attr!(
+                self.tcx,
+                adt.did(),
+                CfiEncoding { encoding } => (AbiNameClass::CfiEncoded, *encoding)
+            )
+            .unwrap_or_else(|| (AbiNameClass::Normal, self.tcx.item_name(adt.did())))
+        };
+
+        if !(
+            // They must both be structs.
+            (caller_adt.is_struct() && callee_adt.is_struct())
+            // They must have equal `repr`, and it must be `repr(C)`.
+            && (caller_adt.repr().c() && caller_adt.repr().equal_up_to_seed(&callee_adt.repr()))
+            // They must have the same name.
+            && abi_name(*caller_adt) == abi_name(*callee_adt)
+        ) {
+            return false;
+        }
+
+        // All fields must have the same names and types as well, where "same type" recursively
+        // uses this check.
+        let caller_fields = &caller_adt.non_enum_variant().fields;
+        let callee_fields = &callee_adt.non_enum_variant().fields;
+        caller_fields.len() == callee_fields.len()
+            && caller_fields.iter().zip(callee_fields).all(|(caller_field, callee_field)| {
+                if caller_field.name != callee_field.name {
+                    return false; // Bail on different name.
+                }
+                // Ensure the normalized type is the same.
+                let normalized_field_ty = |field: &FieldDef, args| {
+                    self.tcx.normalize_erasing_regions(self.typing_env, field.ty(*self.tcx, args))
+                };
+                let caller_ty = normalized_field_ty(caller_field, *caller_args);
+                let callee_ty = normalized_field_ty(callee_field, *callee_args);
+                self.identical_c_types(caller_ty, callee_ty)
+            })
+    }
+
     /// Check if these two layouts look like they are fn-ABI-compatible.
     /// (We also compare the `PassMode`, so this doesn't have to check everything. But it turns out
     /// that only checking the `PassMode` is insufficient.)
@@ -252,8 +312,11 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         };
         let caller = unfold(caller)?;
         let callee = unfold(callee)?;
-        // Not-quite-so-fast path: if the types are equal now, they are compatible.
-        if caller.ty == callee.ty {
+        // Not-quite-so-fast path: if the types are c-equal now, they are compatible.
+        // FIXME: This is *not* currently guaranteed by our ABI compatibility docs, but it is needed
+        // for Miri itself when it checks whether shims were called with the right arguments.
+        // We should eventually put this into the docs as well.
+        if self.identical_c_types(caller.ty, callee.ty) {
             return interp_ok(true);
         }
         // Now see if these inner types are compatible.
@@ -326,7 +389,10 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         if self.layout_compat(caller_abi.layout, callee_abi.layout)? {
             // Ensure that our checks imply actual ABI compatibility for this concrete call.
             // (This can fail e.g. if `#[rustc_nonnull_optimization_guaranteed]` is used incorrectly.)
-            assert!(caller_abi.eq_abi(callee_abi));
+            assert!(
+                caller_abi.eq_abi(callee_abi),
+                "these types were deemed ABI-compatible but do not actually have compatible `FnAbi`:\ncaller: {caller_abi:#?}\ncallee: {callee_abi:#?}"
+            );
             interp_ok(true)
         } else {
             trace!(
@@ -416,18 +482,27 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         let _trace = enter_trace_span!(M, step::init_stack_frame, %instance, tracing_separate_thread = Empty);
         let def_id = instance.def_id();
 
+        match (instance.def.requires_caller_location(*self.tcx), with_caller_location) {
+            (false, true) => {
+                throw_ub_format!(
+                    "calling a non-`#[track_caller]` function from a `#[track_caller]` declaration"
+                )
+            }
+            (true, false) => {
+                throw_ub_format!(
+                    "calling a `#[track_caller]` function from a non-`#[track_caller]` declaration"
+                )
+            }
+            _ => {}
+        }
+        let caller_location = with_caller_location.then(|| self.caller_location());
+
         // The first order of business is to figure out the callee signature.
-        // However, that requires the list of variadic arguments.
-        // We use the *caller* information to determine where to split the list of arguments,
-        // and then later check that the callee indeed has the same number of fixed arguments.
-        let extra_tys = if caller_fn_abi.c_variadic {
-            let fixed_count = usize::try_from(caller_fn_abi.fixed_count).unwrap();
-            let extra_tys = args[fixed_count..].iter().map(|arg| arg.layout().ty);
-            self.tcx.mk_type_list_from_iter(extra_tys)
-        } else {
-            ty::List::empty()
-        };
-        let callee_fn_abi = self.fn_abi_of_instance_no_deduced_attrs(instance, extra_tys)?;
+        // We leave the list of extra c-variadic args empty because the callee cannot know about
+        // them, and we don't need them in the `FnAbi`. This also avoids ICEs if the callee is
+        // not actually c-variadic.
+        let extra_args = ty::List::empty();
+        let callee_fn_abi = self.fn_abi_of_instance_no_deduced_attrs(instance, extra_args)?;
 
         if caller_fn_abi.conv != callee_fn_abi.conv {
             throw_ub_format!(
@@ -455,8 +530,10 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         // compile time.
         M::check_fn_target_features(self, instance)?;
 
+        // If the signature says this cannot unwind, reflect this in the unwind destination so that
+        // we don't have to check this later. (`init_fn_call` already did this for the caller so
+        // here we only have to check the callee.)
         if !callee_fn_abi.can_unwind {
-            // The callee cannot unwind, so force the `Unreachable` unwind handling.
             match &mut cont {
                 ReturnContinuation::Stop { .. } => {}
                 ReturnContinuation::Goto { unwind, .. } => {
@@ -494,6 +571,9 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 .collect::<Vec<_>>()
         );
 
+        // Initialize special caller_location "local", if this function has it.
+        self.frame_mut().track_caller_arg = caller_location;
+
         // Determine whether there is a special VaList argument. This is always the
         // last argument, and since arguments start at index 1 that's `arg_count`.
         let va_list_arg = callee_fn_abi.c_variadic.then(|| mir::Local::from_usize(body.arg_count));
@@ -515,7 +595,8 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         // The "where they come from" part is easy, we expect the caller to do any special handling
         // that might be required here (e.g. for untupling).
         // If `with_caller_location` is set we pretend there is an extra argument (that
-        // we will not pass; our `caller_location` intrinsic implementation walks the stack instead).
+        // we will not pass normally; our `caller_location` intrinsic implementation handles
+        // that separately).
         assert_eq!(
             args.len() + if with_caller_location { 1 } else { 0 },
             caller_fn_abi.args.len(),
@@ -574,11 +655,13 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                         ecx.eval_place(dest, /* skip_validity_for_simple_deref */ false)?;
                     let mplace = ecx.force_allocation(&place)?;
 
+                    // There should be no more callee ABI arguments.
+                    assert!(callee_args_abis.next().is_none());
                     // Consume the remaining arguments by putting them into the variable argument
                     // list. We disable retagging to avoid creating protected tags. Protection should
                     // only use callee-side information, and the varargs have no static callee-side type.
                     let varargs = M::with_retag_mode(ecx, RetagMode::None, |ecx| {
-                        ecx.allocate_varargs(&mut caller_args, &mut callee_args_abis)
+                        ecx.allocate_varargs(&mut caller_args)
                     })?;
 
                     // When the frame is dropped, these variable arguments are deallocated.
@@ -657,6 +740,9 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             throw_ub_format!("calling a function with more arguments than it expected");
         }
 
+        // All function arguments have gotten initialized, call corresponding hook.
+        M::after_stack_frame_init(self)?;
+
         // Done!
         self.push_stack_frame_done()
     }
@@ -677,11 +763,17 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         with_caller_location: bool,
         destination: &PlaceTy<'tcx, M::Provenance>,
         target: Option<mir::BasicBlock>,
-        unwind: mir::UnwindAction,
+        mut unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx> {
         let _trace =
             enter_trace_span!(M, step::init_fn_call, tracing_separate_thread = Empty, ?fn_val)
                 .or_if_tracing_disabled(|| trace!("init_fn_call: {:#?}", fn_val));
+
+        // If the signature says this cannot unwind, reflect this in the unwind destination
+        // so that we don't have to check this later.
+        if caller_fn_abi.is_some_and(|abi| !abi.can_unwind) {
+            unwind = mir::UnwindAction::Unreachable;
+        }
 
         let instance = match fn_val {
             FnVal::Instance(instance) => instance,
@@ -703,6 +795,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         match instance.def {
             ty::InstanceKind::Intrinsic(def_id) => {
                 assert!(self.tcx.intrinsic(def_id).is_some());
+                assert!(!with_caller_location);
                 // FIXME: Should `InPlace` arguments be reset to uninit?
                 if let Some(fallback) = M::call_intrinsic(
                     self,
@@ -714,11 +807,16 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 )? {
                     assert!(!self.tcx.intrinsic(fallback.def_id()).unwrap().must_be_overridden);
                     assert_matches!(fallback.def, ty::InstanceKind::Item(_));
+                    // For `#[rustc_intrinsic] fn`, two `Instance`s are involved:
+                    // the original `InstanceKind::Intrinsic` (no caller location arg), and
+                    // the fallback `InstanceKind::Item` (has caller location arg if
+                    // it's `#[track_caller]`).
+                    // We replace the former with the latter.
                     return self.init_fn_call(
                         FnVal::Instance(fallback),
                         (caller_abi, caller_fn_abi),
                         args,
-                        with_caller_location,
+                        fallback.def.requires_caller_location(*self.tcx),
                         destination,
                         target,
                         unwind,
@@ -744,7 +842,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             | ty::InstanceKind::Shim(ty::ShimKind::FnPtr(..))
             | ty::InstanceKind::Shim(ty::ShimKind::DropGlue(..))
             | ty::InstanceKind::Shim(ty::ShimKind::Clone(..))
-            | ty::InstanceKind::Shim(ty::ShimKind::FnPtrAsPtr(..))
+            | ty::InstanceKind::Shim(ty::ShimKind::FnAddrAsPtr(..))
             | ty::InstanceKind::Shim(ty::ShimKind::FnPtrFromPtr(..))
             | ty::InstanceKind::Shim(ty::ShimKind::ThreadLocal(..))
             | ty::InstanceKind::Shim(ty::ShimKind::AsyncDropGlueCtor(..))

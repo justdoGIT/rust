@@ -1,9 +1,11 @@
+//! Test that deriving Reborrow errors on multiple lifetimes and non-Copy/Reborrow fields, and that
+//! CoerceShared errors if field types do not match.
+
 #![feature(reborrow)]
 
 use std::marker::{CoerceShared, PhantomData, Reborrow};
 
 #[derive(Reborrow)]
-//~^ ERROR implementing `Reborrow` requires that a single lifetime parameter is passed between source and target
 struct TooManyLifetimes<'a, 'b>(PhantomData<(&'a (), &'b ())>);
 
 #[derive(Clone, Copy)]

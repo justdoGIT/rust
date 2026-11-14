@@ -4,6 +4,7 @@ use std::fmt::Debug;
 use std::ops;
 
 use rustc_data_structures::outline;
+use rustc_span::bug;
 use thin_vec::ThinVec;
 use tracing::instrument;
 
@@ -144,7 +145,7 @@ impl<'tcx> PlaceTy<'tcx> {
         } else {
             match self_ty.kind() {
                 ty::Adt(adt_def, args) if !adt_def.is_enum() => {
-                    adt_def.non_enum_variant().fields[f].ty(tcx, args)
+                    adt_def.non_enum_variant().fields[f].ty(tcx, *args)
                 }
                 ty::Closure(_, args) => Unnormalized::dummy(
                     args.as_closure()
@@ -222,6 +223,7 @@ impl<'tcx> PlaceTy<'tcx> {
                 });
                 PlaceTy::from_ty(ty)
             }
+            ProjectionElem::PhantomDeref => PlaceTy::from_ty(self.ty),
             ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
                 PlaceTy::from_ty(self.ty.builtin_index().unwrap())
             }
@@ -260,7 +262,7 @@ impl<V, T> ProjectionElem<V, T> {
     /// than the base.
     pub fn is_indirect(&self) -> bool {
         match self {
-            Self::Deref => true,
+            Self::Deref | Self::PhantomDeref => true,
 
             Self::Field(_, _)
             | Self::Index(_)
@@ -282,7 +284,8 @@ impl<V, T> ProjectionElem<V, T> {
             | Self::ConstantIndex { .. }
             | Self::Subslice { .. }
             | Self::Downcast(_, _)
-            | Self::UnwrapUnsafeBinder(..) => true,
+            | Self::UnwrapUnsafeBinder(..)
+            | Self::PhantomDeref => true,
         }
     }
 
@@ -306,7 +309,8 @@ impl<V, T> ProjectionElem<V, T> {
             Self::ConstantIndex { from_end: true, .. }
             | Self::Index(_)
             | Self::OpaqueCast(_)
-            | Self::Subslice { .. } => false,
+            | Self::Subslice { .. }
+            | Self::PhantomDeref => false,
 
             // FIXME(unsafe_binders): Figure this out.
             Self::UnwrapUnsafeBinder(..) => false,
@@ -326,6 +330,7 @@ impl<V, T> ProjectionElem<V, T> {
     ) -> Option<ProjectionElem<V2, T2>> {
         Some(match self {
             ProjectionElem::Deref => ProjectionElem::Deref,
+            ProjectionElem::PhantomDeref => bug!("PhantomDeref shouldn't hopefully come here"),
             ProjectionElem::Downcast(name, read_variant) => {
                 ProjectionElem::Downcast(name, read_variant)
             }
@@ -443,7 +448,7 @@ impl<'tcx> Place<'tcx> {
         let ty = self.ty(local_decls, tcx).ty;
         let ty::Adt(adt, args) = ty.kind() else { panic!("projecting to field of non-ADT {ty}") };
         let field = &adt.non_enum_variant().fields[idx];
-        let field_ty = field.ty(tcx, args).skip_norm_wip();
+        let field_ty = field.ty(tcx, *args).skip_norm_wip();
         self.project_deeper(&[ProjectionElem::Field(idx, field_ty)], tcx)
     }
 
@@ -488,7 +493,10 @@ impl<'tcx> PlaceRef<'tcx> {
     pub fn local_or_deref_local(&self) -> Option<Local> {
         match *self {
             PlaceRef { local, projection: [] }
-            | PlaceRef { local, projection: [ProjectionElem::Deref] } => Some(local),
+            | PlaceRef {
+                local,
+                projection: [ProjectionElem::Deref | ProjectionElem::PhantomDeref],
+            } => Some(local),
             _ => None,
         }
     }
@@ -560,6 +568,7 @@ impl<'tcx> PlaceRef<'tcx> {
         std::iter::once(self.local).chain(self.projection.iter().filter_map(|proj| match proj {
             ProjectionElem::Index(local) => Some(*local),
             ProjectionElem::Deref
+            | ProjectionElem::PhantomDeref
             | ProjectionElem::Field(_, _)
             | ProjectionElem::ConstantIndex { .. }
             | ProjectionElem::Subslice { .. }
@@ -629,7 +638,7 @@ impl<'tcx> Operand<'tcx> {
     pub fn unevaluated_constant(
         tcx: TyCtxt<'tcx>,
         def_id: DefId,
-        args: &[GenericArg<'tcx>],
+        args: GenericArgs<'tcx>,
         span: Span,
     ) -> Self {
         let const_ = Const::from_unevaluated(tcx, def_id).instantiate(tcx, args).skip_norm_wip();
@@ -702,7 +711,7 @@ impl<'tcx> Operand<'tcx> {
     ///
     /// While this is unlikely in general, it's the normal case of what you'll
     /// find as the `func` in a [`TerminatorKind::Call`].
-    pub fn const_fn_def(&self) -> Option<(DefId, GenericArgsRef<'tcx>)> {
+    pub fn const_fn_def(&self) -> Option<(DefId, GenericArgs<'tcx>)> {
         let const_ty = self.constant()?.const_.ty();
         if let ty::FnDef(def_id, args) = *const_ty.kind() {
             Some((def_id, args.no_bound_vars().unwrap()))

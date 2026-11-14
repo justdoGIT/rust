@@ -15,7 +15,7 @@ use rustc_hir::{
 use rustc_index::IndexVec;
 use rustc_macros::{Lift, StableHash, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
 use rustc_session::Session;
-use rustc_span::Span;
+use rustc_span::{Span, bug};
 
 use crate::hir::place::Place as HirPlace;
 use crate::infer::canonical::Canonical;
@@ -23,8 +23,8 @@ use crate::mir::FakeReadCause;
 use crate::thir::DerefPatBorrowMode;
 use crate::traits::ObligationCause;
 use crate::ty::{
-    self, BoundVar, CanonicalPolyFnSig, ClosureSizeProfileData, GenericArgKind, GenericArgs,
-    GenericArgsRef, Ty, UserArgs, tls,
+    self, BoundVar, CanonicalPolyFnSig, ClosureSizeProfileData, GenericArgKind, GenericArgs, Ty,
+    UserArgs, tls,
 };
 
 #[derive(TyEncodable, TyDecodable, Debug, StableHash)]
@@ -54,7 +54,7 @@ pub struct TypeckResults<'tcx> {
     /// of this node. This only applies to nodes that refer to entities
     /// parameterized by type parameters, such as generic fns, types, or
     /// other items.
-    node_args: ItemLocalMap<GenericArgsRef<'tcx>>,
+    node_args: ItemLocalMap<GenericArgs<'tcx>>,
 
     /// This will either store the canonicalized types provided by the user
     /// or the generic parameters that the user explicitly gave (if any) attached
@@ -101,7 +101,7 @@ pub struct TypeckResults<'tcx> {
     /// leads to a `vec![&Box<Option<i32>>, Box<Option<i32>>]`. Empty vectors are not stored.
     ///
     /// See:
-    /// <https://github.com/rust-lang/rfcs/blob/master/text/2005-match-ergonomics.md#definitions>
+    /// <https://rust-lang.github.io/rfcs/2005-match-ergonomics.html#definitions>
     pat_adjustments: ItemLocalMap<Vec<ty::adjustment::PatAdjustment<'tcx>>>,
 
     /// Set of reference patterns that match against a match-ergonomics inserted reference
@@ -206,7 +206,7 @@ pub struct TypeckResults<'tcx> {
 
     /// Goals proven during HIR typeck which may be potentially region dependent.
     ///
-    /// Borrowck *uniquifies* regions which may cause these goal to be ambiguous in MIR
+    /// Borrowck *uniquifies* regions which may cause these goals to be ambiguous in MIR
     /// type check. We ICE if goals fail in borrowck to detect bugs during MIR building or
     /// missed checks in HIR typeck. To avoid ICE due to region dependence we store all
     /// goals which may be region dependent and reprove them in case borrowck encounters
@@ -357,16 +357,16 @@ impl<'tcx> TypeckResults<'tcx> {
         self.node_types.get(&id.local_id).cloned()
     }
 
-    pub fn node_args_mut(&mut self) -> LocalTableInContextMut<'_, GenericArgsRef<'tcx>> {
+    pub fn node_args_mut(&mut self) -> LocalTableInContextMut<'_, GenericArgs<'tcx>> {
         LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.node_args }
     }
 
-    pub fn node_args(&self, id: HirId) -> GenericArgsRef<'tcx> {
+    pub fn node_args(&self, id: HirId) -> GenericArgs<'tcx> {
         validate_hir_id_for_typeck_results(self.hir_owner, id);
         self.node_args.get(&id.local_id).cloned().unwrap_or_else(|| GenericArgs::empty())
     }
 
-    pub fn node_args_opt(&self, id: HirId) -> Option<GenericArgsRef<'tcx>> {
+    pub fn node_args_opt(&self, id: HirId) -> Option<GenericArgs<'tcx>> {
         validate_hir_id_for_typeck_results(self.hir_owner, id);
         self.node_args.get(&id.local_id).cloned()
     }
@@ -880,7 +880,7 @@ impl<'tcx> IsIdentity for CanonicalUserType<'tcx> {
                     return false;
                 }
 
-                iter::zip(user_args.args, BoundVar::ZERO..).all(|(arg, cvar)| {
+                iter::zip(user_args.args.as_slice(), BoundVar::ZERO..).all(|(arg, cvar)| {
                     match arg.kind() {
                         GenericArgKind::Type(ty) => match ty.kind() {
                             ty::Bound(debruijn, b) => {

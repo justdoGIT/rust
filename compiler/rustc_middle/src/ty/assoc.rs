@@ -4,7 +4,7 @@ use rustc_hir::def::{DefKind, Namespace};
 use rustc_hir::def_id::DefId;
 use rustc_macros::{Decodable, Encodable, StableHash};
 use rustc_span::def_id::ModId;
-use rustc_span::{ErrorGuaranteed, Ident, Symbol};
+use rustc_span::{ErrorGuaranteed, Ident, Symbol, bug};
 
 use super::{TyCtxt, Visibility};
 use crate::ty;
@@ -31,15 +31,16 @@ impl AssocItem {
         match self.kind {
             ty::AssocKind::Type { data: AssocTypeData::Normal(name) } => Some(name),
             ty::AssocKind::Type { data: AssocTypeData::Rpitit(_) } => None,
-            ty::AssocKind::Const { name, .. } => Some(name),
+            ty::AssocKind::Const { data: AssocConstData::Named(name), .. } => Some(name),
+            ty::AssocKind::Const { data: AssocConstData::Anonymous, .. } => None,
             ty::AssocKind::Fn { name, .. } => Some(name),
         }
     }
 
-    // Gets the identifier name. Aborts if it lacks one, i.e. is an RPITIT
-    // associated type.
+    // Gets the identifier name. Aborts if it lacks one, e.g. for an RPITIT
+    // associated type or an anonymous associated const.
     pub fn name(&self) -> Symbol {
-        self.opt_name().expect("name of non-Rpitit assoc item")
+        self.opt_name().expect("name of anonymous associated item")
     }
 
     pub fn ident(&self, tcx: TyCtxt<'_>) -> Ident {
@@ -120,7 +121,11 @@ impl AssocItem {
                 tcx.fn_sig(self.def_id).instantiate_identity().skip_binder().to_string()
             }
             ty::AssocKind::Type { .. } => format!("type {};", self.name()),
-            ty::AssocKind::Const { name, .. } => {
+            ty::AssocKind::Const { data, .. } => {
+                let name = match data {
+                    AssocConstData::Named(name) => name,
+                    AssocConstData::Anonymous => rustc_span::symbol::kw::Underscore,
+                };
                 format!("const {}: {:?};", name, tcx.type_of(self.def_id).instantiate_identity())
             }
         }
@@ -138,20 +143,19 @@ impl AssocItem {
         self.kind.as_def_kind()
     }
 
-    pub fn is_type_const(&self) -> bool {
-        matches!(self.kind, ty::AssocKind::Const { is_type_const: true, .. })
-    }
-
     /// Whether this associated item can be constrained with an equality binding.
     pub fn can_have_equality_constraint(&self, tcx: TyCtxt<'_>) -> bool {
         match self.kind {
             ty::AssocKind::Type { .. } => true,
-            ty::AssocKind::Const { is_type_const: true, .. } => true,
-            ty::AssocKind::Const { is_type_const: false, .. } => {
-                tcx.features().generic_const_args()
+            ty::AssocKind::Const { .. } => {
+                tcx.features().gca_const_items() || tcx.is_direct_const(self.def_id)
             }
             ty::AssocKind::Fn { .. } => false,
         }
+    }
+
+    pub fn is_anon_const(&self) -> bool {
+        matches!(self.kind, ty::AssocKind::Const { data: AssocConstData::Anonymous, .. })
     }
 
     pub fn is_fn(&self) -> bool {
@@ -185,8 +189,15 @@ pub enum AssocTypeData {
 }
 
 #[derive(Copy, Clone, PartialEq, Debug, StableHash, Eq, Hash, Encodable, Decodable)]
+pub enum AssocConstData {
+    Named(Symbol),
+    /// An associated constant named `_`, which *semantically* has no name.
+    Anonymous,
+}
+
+#[derive(Copy, Clone, PartialEq, Debug, StableHash, Eq, Hash, Encodable, Decodable)]
 pub enum AssocKind {
-    Const { name: Symbol, is_type_const: bool },
+    Const { data: AssocConstData },
     Fn { name: Symbol, has_self: bool },
     Type { data: AssocTypeData },
 }
@@ -209,9 +220,7 @@ impl AssocKind {
 
     pub fn as_def_kind(&self) -> DefKind {
         match self {
-            Self::Const { is_type_const, .. } => {
-                DefKind::AssocConst { is_type_const: *is_type_const }
-            }
+            Self::Const { .. } => DefKind::AssocConst,
             Self::Fn { .. } => DefKind::AssocFn,
             Self::Type { .. } => DefKind::AssocTy,
         }
@@ -273,6 +282,14 @@ impl AssocItems {
     /// for a known trait, make that trait a lang item instead of indexing this array.
     pub fn in_definition_order(&self) -> impl '_ + Iterator<Item = &ty::AssocItem> {
         self.items.iter().map(|(_, v)| v)
+    }
+
+    /// Returns named associated items in definition order.
+    ///
+    /// New code should avoid relying on definition order. If you need a particular associated item
+    /// for a known trait, make that trait a lang item instead of indexing this array.
+    pub fn named_items_in_definition_order(&self) -> impl '_ + Iterator<Item = &ty::AssocItem> {
+        self.items.iter().filter_map(|(name, v)| name.is_some().then(|| v))
     }
 
     pub fn len(&self) -> usize {

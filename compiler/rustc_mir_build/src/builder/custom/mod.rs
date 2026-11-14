@@ -16,16 +16,15 @@
 //! "top-level" constructs can be found in the `parse` submodule, while the parsing for statements,
 //! terminators, and everything below can be found in the `parse::instruction` submodule.
 //!
-
+use rustc_attr_ir as attrs;
 use rustc_data_structures::fx::FxHashMap;
+use rustc_hir::HirId;
 use rustc_hir::def_id::DefId;
-use rustc_hir::{HirId, attrs};
-use rustc_index::{IndexSlice, IndexVec};
-use rustc_middle::bug;
+use rustc_index::{IndexSlice, IndexVec, indexvec};
 use rustc_middle::mir::*;
 use rustc_middle::thir::*;
 use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_span::Span;
+use rustc_span::{Span, bug};
 
 mod parse;
 
@@ -60,12 +59,11 @@ pub(super) fn build_custom_mir<'tcx>(
         tainted_by_errors: None,
         injection_phase: None,
         pass_count: 0,
-        coverage_info_hi: None,
-        function_coverage_info: None,
+        coverage_early_info: None,
+        coverage_mir_info: None,
     };
 
     body.local_decls.push(LocalDecl::new(return_ty, return_ty_span));
-    body.basic_blocks_mut().push(BasicBlockData::new(None, false));
     body.source_scopes.push(SourceScopeData {
         span,
         parent_scope: None,
@@ -81,6 +79,8 @@ pub(super) fn build_custom_mir<'tcx>(
         thir,
         source_scope: OUTERMOST_SOURCE_SCOPE,
         body: &mut body,
+        // Single `false` for entry block which is declared implicitly
+        block_decls: indexvec![false],
         local_map: FxHashMap::default(),
         block_map: FxHashMap::default(),
     };
@@ -139,6 +139,8 @@ struct ParseCtxt<'a, 'tcx> {
     thir: &'a Thir<'tcx>,
     source_scope: SourceScope,
     body: &'a mut Body<'tcx>,
+    /// list of declared blocks, with a flag indicating whether it is a cleanup block
+    block_decls: IndexVec<BasicBlock, bool>,
     local_map: FxHashMap<LocalVarId, Local>,
     block_map: FxHashMap<LocalVarId, BasicBlock>,
 }

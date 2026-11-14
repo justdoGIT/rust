@@ -17,13 +17,9 @@ use thin_vec::thin_vec;
 use crate::diagnostics;
 use crate::util::{expr_to_string, get_exprs_from_tts, get_single_expr_from_tts};
 
-fn lookup_env<'cx>(cx: &'cx ExtCtxt<'_>, var: Symbol) -> Result<Symbol, VarError> {
+fn lookup_env(var: Symbol) -> Result<Symbol, VarError> {
     let var = var.as_str();
-    if let Some(value) = cx.sess.opts.logical_env.get(var) {
-        return Ok(Symbol::intern(value));
-    }
-    // If the environment variable was not defined with the `--env-set` option, we try to retrieve it
-    // from rustc's environment.
+    // Try to retrieve the environment variable from rustc's environment.
     Ok(Symbol::intern(&env::var(var)?))
 }
 
@@ -40,7 +36,7 @@ pub(crate) fn expand_option_env<'cx>(
         Err(guar) => return ExpandResult::Ready(DummyResult::any(sp, guar)),
     };
     let ExpandResult::Ready(mac) =
-        expr_to_string(cx, var_expr.clone(), "argument must be a string literal")
+        expr_to_string(cx, var_expr, "argument must be a string literal")
     else {
         return ExpandResult::Retry(());
     };
@@ -50,18 +46,17 @@ pub(crate) fn expand_option_env<'cx>(
     };
 
     let sp = cx.with_def_site_ctxt(sp);
-    let value = lookup_env(cx, var);
+    let value = lookup_env(var);
     cx.sess.env_depinfo.borrow_mut().insert((var, value.as_ref().ok().copied()));
     let e = match value {
         Err(VarError::NotPresent) => {
             let lt = cx.lifetime(sp, Ident::new(kw::StaticLifetime, sp));
-            cx.expr_path(cx.path_all(
+            cx.expr_path(cx.std_path_all(
                 sp,
-                true,
-                cx.std_path(&[sym::option, sym::Option, sym::None]),
+                &[sym::option, sym::Option, sym::None],
                 vec![GenericArg::Type(cx.ty_ref(
                     sp,
-                    cx.ty_ident(sp, Ident::new(sym::str, sp)),
+                    cx.ty_name(sp, sym::str),
                     Some(lt),
                     Mutability::Not,
                 ))],
@@ -74,7 +69,7 @@ pub(crate) fn expand_option_env<'cx>(
         }
         Ok(value) => cx.expr_call_global(
             sp,
-            cx.std_path(&[sym::option, sym::Option, sym::Some]),
+            cx.std_path(sp, &[sym::option, sym::Option, sym::Some]),
             thin_vec![cx.expr_str(sp, value)],
         ),
     };
@@ -124,7 +119,7 @@ pub(crate) fn expand_env<'cx>(
     };
 
     let span = cx.with_def_site_ctxt(sp);
-    let value = lookup_env(cx, var);
+    let value = lookup_env(var);
     cx.sess.env_depinfo.borrow_mut().insert((var, value.as_ref().ok().copied()));
     let e = match value {
         Err(VarError::NotPresent) => {

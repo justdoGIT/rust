@@ -189,7 +189,7 @@ pub(super) const MIN_LEN: usize = node::MIN_LEN_AFTER_SPLIT;
 pub struct BTreeMap<
     K,
     V,
-    #[unstable(feature = "allocator_api", issue = "32838")] A: AllocatorClone = Global,
+    #[unstable(feature = "allocator_ext", issue = "163177", implied_by = "allocator_api")] A: AllocatorClone = Global,
 > {
     root: Option<Root<K, V>>,
     length: usize,
@@ -205,7 +205,14 @@ pub struct BTreeMap<
 #[stable(feature = "btree_drop", since = "1.7.0")]
 unsafe impl<#[may_dangle] K, #[may_dangle] V, A: AllocatorClone> Drop for BTreeMap<K, V, A> {
     fn drop(&mut self) {
-        drop(unsafe { ptr::read(self) }.into_iter())
+        if let Some(root) = self.root.take() {
+            // SAFETY: The tree won't be used after this point.
+            // The allocator has not been moved out and will be moved into `drop_tree`.
+            unsafe { root.into_dying().drop_tree(ManuallyDrop::take(&mut self.alloc)) };
+        } else {
+            // SAFETY: The allocator has not been moved out and won't be used after this point.
+            unsafe { ManuallyDrop::drop(&mut self.alloc) };
+        }
     }
 }
 
@@ -279,9 +286,10 @@ impl<K: Clone, V: Clone, A: AllocatorClone> Clone for BTreeMap<K, V, A> {
 
                             // We can't destructure subtree directly
                             // because BTreeMap implements Drop
-                            let (subroot, sublength) = unsafe {
+                            let (subroot, sublength) = {
                                 let subtree = ManuallyDrop::new(subtree);
-                                let root = ptr::read(&subtree.root);
+                                // ignore-tidy-undocumented-unsafe
+                                let root = unsafe { ptr::read(&subtree.root) };
                                 let length = subtree.length;
                                 (root, length)
                             };
@@ -444,7 +452,7 @@ impl<'a, K: 'a, V: 'a> Default for IterMut<'a, K, V> {
 pub struct IntoIter<
     K,
     V,
-    #[unstable(feature = "allocator_api", issue = "32838")] A: AllocatorClone = Global,
+    #[unstable(feature = "allocator_ext", issue = "163177", implied_by = "allocator_api")] A: AllocatorClone = Global,
 > {
     range: LazyLeafRange<marker::Dying, K, V>,
     length: usize,
@@ -552,7 +560,7 @@ impl<K, V: fmt::Debug> fmt::Debug for ValuesMut<'_, K, V> {
 pub struct IntoKeys<
     K,
     V,
-    #[unstable(feature = "allocator_api", issue = "32838")] A: AllocatorClone = Global,
+    #[unstable(feature = "allocator_ext", issue = "163177", implied_by = "allocator_api")] A: AllocatorClone = Global,
 > {
     inner: IntoIter<K, V, A>,
 }
@@ -575,7 +583,7 @@ impl<K: fmt::Debug, V, A: AllocatorClone> fmt::Debug for IntoKeys<K, V, A> {
 pub struct IntoValues<
     K,
     V,
-    #[unstable(feature = "allocator_api", issue = "32838")] A: AllocatorClone = Global,
+    #[unstable(feature = "allocator_ext", issue = "163177", implied_by = "allocator_api")] A: AllocatorClone = Global,
 > {
     inner: IntoIter<K, V, A>,
 }
@@ -682,7 +690,6 @@ impl<K, V, A: AllocatorClone> BTreeMap<K, V, A> {
     /// # Examples
     ///
     /// ```
-    /// # #![feature(allocator_api)]
     /// # #![feature(btreemap_alloc)]
     ///
     /// use std::collections::BTreeMap;
@@ -690,10 +697,17 @@ impl<K, V, A: AllocatorClone> BTreeMap<K, V, A> {
     ///
     /// let map: BTreeMap<i32, i32> = BTreeMap::new_in(Global);
     /// ```
-    #[unstable(feature = "btreemap_alloc", issue = "32838")]
+    #[unstable(feature = "btreemap_alloc", issue = "163177")]
     #[must_use]
     pub const fn new_in(alloc: A) -> BTreeMap<K, V, A> {
         BTreeMap { root: None, length: 0, alloc: ManuallyDrop::new(alloc), _marker: PhantomData }
+    }
+
+    /// Returns a reference to the underlying allocator.
+    #[unstable(feature = "btreemap_alloc", issue = "163177")]
+    #[inline]
+    pub fn allocator(&self) -> &A {
+        &self.alloc
     }
 }
 
@@ -1320,10 +1334,10 @@ impl<K, V, A: AllocatorClone> BTreeMap<K, V, A> {
                     // this through using a drop handler and transmutating CursorMutKey<K, V>
                     // to CursorMutKey<ManuallyDrop<K>, ManuallyDrop<V>> (see PR #152418)
                     if let Some((k, v)) = self_cursor.remove_next() {
+                        let v = conflict(&k, v, first_other_val);
                         // SAFETY: we remove the K, V out of the next entry,
                         // apply 'f' to get a new (K, V), and insert it back
                         // into the next entry that the cursor is pointing at
-                        let v = conflict(&k, v, first_other_val);
                         unsafe { self_cursor.insert_after_unchecked(k, v) };
                     }
                 }
@@ -1356,10 +1370,10 @@ impl<K, V, A: AllocatorClone> BTreeMap<K, V, A> {
                             // this through using a drop handler and transmutating CursorMutKey<K, V>
                             // to CursorMutKey<ManuallyDrop<K>, ManuallyDrop<V>> (see PR #152418)
                             if let Some((k, v)) = self_cursor.remove_next() {
+                                let v = conflict(&k, v, other_val);
                                 // SAFETY: we remove the K, V out of the next entry,
                                 // apply 'f' to get a new (K, V), and insert it back
                                 // into the next entry that the cursor is pointing at
-                                let v = conflict(&k, v, other_val);
                                 unsafe { self_cursor.insert_after_unchecked(k, v) };
                             }
                             break;
@@ -1737,6 +1751,7 @@ impl<'a, K: 'a, V: 'a> Iterator for Iter<'a, K, V> {
             None
         } else {
             self.length -= 1;
+            // SAFETY: Ensured by check.
             Some(unsafe { self.range.next_unchecked() })
         }
     }
@@ -1774,6 +1789,7 @@ impl<'a, K: 'a, V: 'a> DoubleEndedIterator for Iter<'a, K, V> {
             None
         } else {
             self.length -= 1;
+            // SAFETY: Ensured by check.
             Some(unsafe { self.range.next_back_unchecked() })
         }
     }
@@ -1815,6 +1831,7 @@ impl<'a, K, V> Iterator for IterMut<'a, K, V> {
             None
         } else {
             self.length -= 1;
+            // SAFETY: Ensured by check.
             Some(unsafe { self.range.next_unchecked() })
         }
     }
@@ -1849,6 +1866,7 @@ impl<'a, K, V> DoubleEndedIterator for IterMut<'a, K, V> {
             None
         } else {
             self.length -= 1;
+            // SAFETY: Ensured by check.
             Some(unsafe { self.range.next_back_unchecked() })
         }
     }
@@ -1889,12 +1907,14 @@ impl<K, V, A: AllocatorClone> IntoIterator for BTreeMap<K, V, A> {
             IntoIter {
                 range: full_range,
                 length: me.length,
+                // ignore-tidy-undocumented-unsafe
                 alloc: unsafe { ManuallyDrop::take(&mut me.alloc) },
             }
         } else {
             IntoIter {
                 range: LazyLeafRange::none(),
                 length: 0,
+                // ignore-tidy-undocumented-unsafe
                 alloc: unsafe { ManuallyDrop::take(&mut me.alloc) },
             }
         }
@@ -1937,6 +1957,7 @@ impl<K, V, A: AllocatorClone> IntoIter<K, V, A> {
             None
         } else {
             self.length -= 1;
+            // ignore-tidy-undocumented-unsafe
             Some(unsafe { self.range.deallocating_next_unchecked(self.alloc.clone()) })
         }
     }
@@ -1951,6 +1972,7 @@ impl<K, V, A: AllocatorClone> IntoIter<K, V, A> {
             None
         } else {
             self.length -= 1;
+            // ignore-tidy-undocumented-unsafe
             Some(unsafe { self.range.deallocating_next_back_unchecked(self.alloc.clone()) })
         }
     }
@@ -2133,7 +2155,7 @@ pub struct ExtractIf<
     V,
     R,
     F,
-    #[unstable(feature = "allocator_api", issue = "32838")] A: AllocatorClone = Global,
+    #[unstable(feature = "allocator_ext", issue = "163177", implied_by = "allocator_api")] A: AllocatorClone = Global,
 > {
     pred: F,
     inner: ExtractIfInner<'a, K, V, R>,
@@ -2541,7 +2563,7 @@ impl<K: Ord, V> FromIterator<(K, V)> for BTreeMap<K, V> {
     ///
     /// If the iterator produces any pairs with equal keys,
     /// all but one of the corresponding values will be dropped.
-    fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> BTreeMap<K, V> {
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> BTreeMap<K, V> {
         let mut inputs: Vec<_> = iter.into_iter().collect();
 
         if inputs.is_empty() {
@@ -2557,7 +2579,7 @@ impl<K: Ord, V> FromIterator<(K, V)> for BTreeMap<K, V> {
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<K: Ord, V, A: AllocatorClone> Extend<(K, V)> for BTreeMap<K, V, A> {
     #[inline]
-    fn extend<T: IntoIterator<Item = (K, V)>>(&mut self, iter: T) {
+    fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
         iter.into_iter().for_each(move |(k, v)| {
             self.insert(k, v);
         });
@@ -2815,11 +2837,7 @@ impl<K, V, A: AllocatorClone> BTreeMap<K, V, A> {
     /// ```
     #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_const_unstable(
-        feature = "const_btree_len",
-        issue = "71835",
-        implied_by = "const_btree_new"
-    )]
+    #[rustc_const_stable(feature = "const_btree_len", since = "1.101.0")]
     #[rustc_confusables("length", "size")]
     pub const fn len(&self) -> usize {
         self.length
@@ -2839,11 +2857,7 @@ impl<K, V, A: AllocatorClone> BTreeMap<K, V, A> {
     /// ```
     #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_const_unstable(
-        feature = "const_btree_len",
-        issue = "71835",
-        implied_by = "const_btree_new"
-    )]
+    #[rustc_const_stable(feature = "const_btree_len", since = "1.101.0")]
     pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -3142,7 +3156,7 @@ pub struct CursorMut<
     'a,
     K: 'a,
     V: 'a,
-    #[unstable(feature = "allocator_api", issue = "32838")] A = Global,
+    #[unstable(feature = "allocator_ext", issue = "163177", implied_by = "allocator_api")] A = Global,
 > {
     inner: CursorMutKey<'a, K, V, A>,
 }
@@ -3180,7 +3194,7 @@ pub struct CursorMutKey<
     'a,
     K: 'a,
     V: 'a,
-    #[unstable(feature = "allocator_api", issue = "32838")] A = Global,
+    #[unstable(feature = "allocator_ext", issue = "163177", implied_by = "allocator_api")] A = Global,
 > {
     // If current is None then it means the tree has not been allocated yet.
     current: Option<Handle<NodeRef<marker::Mut<'a>, K, V, marker::Leaf>, marker::Edge>>,
@@ -3345,6 +3359,7 @@ impl<'a, K, V, A> CursorMutKey<'a, K, V, A> {
                 let (k, v) = unsafe { kv.reborrow_mut().into_kv_mut() };
                 let (k, v) = (k as *mut _, v as *mut _);
                 self.current = Some(kv.next_leaf_edge());
+                // ignore-tidy-undocumented-unsafe
                 Some(unsafe { (&mut *k, &mut *v) })
             }
             Err(root) => {
@@ -3370,6 +3385,7 @@ impl<'a, K, V, A> CursorMutKey<'a, K, V, A> {
                 let (k, v) = unsafe { kv.reborrow_mut().into_kv_mut() };
                 let (k, v) = (k as *mut _, v as *mut _);
                 self.current = Some(kv.next_back_leaf_edge());
+                // ignore-tidy-undocumented-unsafe
                 Some(unsafe { (&mut *k, &mut *v) })
             }
             Err(root) => {
@@ -3532,6 +3548,7 @@ impl<'a, K: Ord, V, A: AllocatorClone> CursorMutKey<'a, K, V, A> {
                 return Err(UnorderedKeyError {});
             }
         }
+        // SAFETY: Ensured by checks above.
         unsafe {
             self.insert_after_unchecked(key, value);
         }
@@ -3560,6 +3577,7 @@ impl<'a, K: Ord, V, A: AllocatorClone> CursorMutKey<'a, K, V, A> {
                 return Err(UnorderedKeyError {});
             }
         }
+        // SAFETY: Ensured by checks above.
         unsafe {
             self.insert_before_unchecked(key, value);
         }
@@ -3641,6 +3659,7 @@ impl<'a, K: Ord, V, A: AllocatorClone> CursorMut<'a, K, V, A> {
     /// * All keys in the tree must remain in sorted order.
     #[unstable(feature = "btree_cursors", issue = "107540")]
     pub unsafe fn insert_after_unchecked(&mut self, key: K, value: V) {
+        // SAFETY: Upheld by caller.
         unsafe { self.inner.insert_after_unchecked(key, value) }
     }
 
@@ -3659,6 +3678,7 @@ impl<'a, K: Ord, V, A: AllocatorClone> CursorMut<'a, K, V, A> {
     /// * All keys in the tree must remain in sorted order.
     #[unstable(feature = "btree_cursors", issue = "107540")]
     pub unsafe fn insert_before_unchecked(&mut self, key: K, value: V) {
+        // SAFETY: Upheld by caller.
         unsafe { self.inner.insert_before_unchecked(key, value) }
     }
 

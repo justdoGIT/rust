@@ -2,7 +2,6 @@
 
 // tidy-alphabetical-start
 #![allow(internal_features)]
-#![cfg_attr(bootstrap, feature(never_type))]
 #![feature(default_field_values)]
 #![feature(deref_patterns)]
 #![feature(file_buffered)]
@@ -41,14 +40,13 @@ use rustc_middle::query::Providers;
 use rustc_middle::ty::{
     self, ParamEnv, RegionVid, Ty, TyCtxt, TypeFoldable, TypeVisitable, TypingMode, fold_regions,
 };
-use rustc_middle::{bug, span_bug};
 use rustc_mir_dataflow::impls::{EverInitializedPlaces, MaybeUninitializedPlaces};
 use rustc_mir_dataflow::move_paths::{
     InitIndex, InitLocation, LookupResult, MoveData, MovePathIndex,
 };
 use rustc_mir_dataflow::points::DenseLocationMap;
 use rustc_mir_dataflow::{Analysis, EntryStates, Results, ResultsVisitor, visit_results};
-use rustc_span::{ErrorGuaranteed, Span, Symbol};
+use rustc_span::{ErrorGuaranteed, Span, Symbol, bug, span_bug};
 use rustc_trait_selection::traits::query::type_op::{QueryTypeOp, TypeOp, TypeOpOutput};
 use smallvec::SmallVec;
 use tracing::{debug, instrument};
@@ -156,7 +154,7 @@ struct PropagatedBorrowCheckResults<'tcx> {
     used_mut_upvars: SmallVec<[FieldIdx; 8]>,
 }
 
-type DeferredClosureRequirements<'tcx> = Vec<(LocalDefId, ty::GenericArgsRef<'tcx>, Locations)>;
+type DeferredClosureRequirements<'tcx> = Vec<(LocalDefId, ty::GenericArgs<'tcx>, Locations)>;
 
 /// After we borrow check a closure, we are left with various
 /// requirements that we have inferred between the free regions that
@@ -233,7 +231,7 @@ pub struct ClosureOutlivesRequirement<'tcx> {
 
 // Make sure this enum doesn't unintentionally grow
 #[cfg(target_pointer_width = "64")]
-rustc_data_structures::static_assert_size!(ConstraintCategory<'_>, 16);
+rustc_data_structures::static_assert_size!(ConstraintCategory<'_>, 24);
 
 /// The subject of a `ClosureOutlivesRequirement` -- that is, the thing
 /// that must outlive some region.
@@ -311,7 +309,7 @@ struct CollectRegionConstraintsResult<'tcx> {
     deferred_closure_requirements: DeferredClosureRequirements<'tcx>,
     deferred_opaque_type_errors: Vec<DeferredOpaqueTypeError<'tcx>>,
     polonius_facts: Option<AllFacts<RustcFacts>>,
-    polonius_context: Option<PoloniusContext>,
+    polonius_context: Option<PoloniusContext<'tcx>>,
 }
 
 /// Start borrow checking by collecting the region constraints for
@@ -348,7 +346,7 @@ fn borrowck_collect_region_constraints<'tcx>(
 
     let location_map = Rc::new(DenseLocationMap::new(body));
 
-    let polonius_input = root_cx.consumer.as_ref().map_or(false, |c| c.polonius_input())
+    let polonius_input = root_cx.consumer.as_ref().is_some_and(|c| c.polonius_input())
         || infcx.tcx.sess.opts.unstable_opts.polonius.is_legacy_enabled();
     let mut polonius_facts =
         (polonius_input || PoloniusFacts::enabled(infcx.tcx)).then_some(PoloniusFacts::default());
@@ -362,7 +360,6 @@ fn borrowck_collect_region_constraints<'tcx>(
         deferred_closure_requirements,
         polonius_context,
     } = type_check::type_check(
-        root_cx,
         &infcx,
         body,
         &promoted,
@@ -660,7 +657,7 @@ pub(crate) struct BorrowckInferCtxt<'tcx> {
 
 impl<'tcx> BorrowckInferCtxt<'tcx> {
     pub(crate) fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId, root_def_id: LocalDefId) -> Self {
-        let typing_mode = if tcx.use_typing_mode_post_typeck_until_borrowck() {
+        let typing_mode = if tcx.use_typing_mode_post_typeck_through_borrowck() {
             TypingMode::borrowck(tcx, def_id)
         } else {
             TypingMode::analysis_in_body(tcx, def_id)
@@ -799,7 +796,7 @@ pub(crate) struct MirBorrowckCtxt<'a, 'diag, 'tcx> {
     /// Results of Polonius analysis.
     polonius_output: Option<&'a PoloniusOutput>,
     /// When using `-Zpolonius=next`: the data used to compute errors and diagnostics.
-    polonius_context: Option<&'a PoloniusContext>,
+    polonius_context: Option<&'a PoloniusContext<'tcx>>,
 }
 
 // Check that:
@@ -981,7 +978,7 @@ impl<'a, 'tcx> ResultsVisitor<'tcx, Borrowck<'a, 'tcx>> for MirBorrowckCtxt<'a, 
                 }
             }
 
-            TerminatorKind::Goto { target: _ }
+            TerminatorKind::Goto { target: _, loop_hint_attrs: _ }
             | TerminatorKind::UnwindTerminate(_)
             | TerminatorKind::Unreachable
             | TerminatorKind::UnwindResume
@@ -1951,6 +1948,9 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, '_, 'tcx> {
                     | ty::Placeholder(_) => {
                         bug!("When Place is Deref it's type shouldn't be {place_ty:#?}")
                     }
+
+                    // FIXME(scrabsha)
+                    ty::View(..) => unimplemented!(),
                 },
                 ProjectionElem::Field(_, _) => match place_ty.ty.kind() {
                     ty::Adt(adt, _) => {
@@ -1993,6 +1993,9 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, '_, 'tcx> {
                     | ty::Placeholder(_) => bug!(
                         "When Place contains ProjectionElem::Field it's type shouldn't be {place_ty:#?}"
                     ),
+
+                    // FIXME(scrabsha)
+                    ty::View(..) => unimplemented!(),
                 },
                 ProjectionElem::ConstantIndex { .. } | ProjectionElem::Subslice { .. } => {
                     match place_ty.ty.kind() {
@@ -2024,7 +2027,8 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, '_, 'tcx> {
                 // So it's safe to skip these.
                 ProjectionElem::OpaqueCast(_)
                 | ProjectionElem::Downcast(_, _)
-                | ProjectionElem::UnwrapUnsafeBinder(_) => (),
+                | ProjectionElem::UnwrapUnsafeBinder(_)
+                | ProjectionElem::PhantomDeref => (),
             }
 
             place_ty = place_ty.projection_ty(tcx, elem);
@@ -2272,6 +2276,10 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, '_, 'tcx> {
                     // (base initialized; no need to
                     // recur further)
                     break;
+                }
+
+                ProjectionElem::PhantomDeref => {
+                    panic!("we don't allow assignments to PhantomDeref, location {location:?}");
                 }
 
                 ProjectionElem::Subslice { .. } => {
@@ -2644,6 +2652,9 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, '_, 'tcx> {
                             _ => bug!("Deref of unexpected type: {:?}", base_ty),
                         }
                     }
+                    ProjectionElem::PhantomDeref => {
+                        bug!("encountered PhantomDeref in is_mutable")
+                    }
                     // Check as the inner reference type if it is a field projection
                     // from the `&pin` pattern
                     ProjectionElem::Field(FieldIdx::ZERO, _)
@@ -2751,6 +2762,7 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, '_, 'tcx> {
             }
 
             let mut_span = tcx.sess.source_map().span_until_non_whitespace(span);
+            let span = span.trim_start(mut_span).unwrap_or(span);
 
             tcx.emit_node_span_lint(UNUSED_MUT, lint_root, span, VarNeedNotMut { span: mut_span })
         }

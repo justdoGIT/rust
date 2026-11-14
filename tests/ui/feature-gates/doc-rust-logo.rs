@@ -1,5 +1,8 @@
 #![doc(rust_logo)]
-//~^ ERROR the `#[doc(rust_logo)]` attribute is used for Rust branding
+//~^ ERROR this subset of the `doc` attribute is meant for internal use only
 //! This is not an official rust crate
 
+#[doc(rust_logo)]
+//~^ ERROR this subset of the `doc` attribute is meant for internal use only
+//~| ERROR this attribute can only be applied at the crate level
 fn main() {}

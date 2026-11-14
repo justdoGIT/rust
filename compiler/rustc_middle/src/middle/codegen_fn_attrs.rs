@@ -1,7 +1,9 @@
 use std::borrow::Cow;
 
 use rustc_abi::Align;
-use rustc_hir::attrs::{InlineAttr, InstructionSetAttr, Linkage, OptimizeAttr, RtsanSetting};
+use rustc_attr_ir::{
+    InlineAttr, InstructionSetAttr, InstrumentFnAttr, Linkage, OptimizeAttr, RtsanSetting,
+};
 use rustc_hir::def_id::DefId;
 use rustc_macros::{StableHash, TyDecodable, TyEncodable};
 use rustc_span::Symbol;
@@ -36,10 +38,6 @@ impl<'tcx> TyCtxt<'tcx> {
         if let InstanceKind::Shim(ShimKind::Reify(_, _)) = instance_kind
             && attrs.flags.contains(CodegenFnAttrFlags::TRACK_CALLER)
         {
-            if attrs.flags.contains(CodegenFnAttrFlags::NO_MANGLE) {
-                attrs.to_mut().flags.remove(CodegenFnAttrFlags::NO_MANGLE);
-            }
-
             if attrs.flags.contains(CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL) {
                 attrs.to_mut().flags.remove(CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL);
             }
@@ -121,23 +119,7 @@ pub struct CodegenFnAttrs {
     /// The `#[rustc_objc_selector = "..."]` attribute.
     pub objc_selector: Option<Symbol>,
     /// The `#[instrument_fn]` attribute.
-    pub instrument_fn: InstrumentFnAttr,
-}
-
-#[derive(Copy, Clone, TyEncodable, TyDecodable, StableHash, Debug)]
-pub enum InstrumentFnAttr {
-    /// Always instrument function
-    On,
-    /// Never instrument function
-    Off,
-    /// Instrument based on command line options, if any.
-    Default,
-}
-
-const impl Default for InstrumentFnAttr {
-    fn default() -> Self {
-        InstrumentFnAttr::Default
-    }
+    pub instrument_fn: Option<InstrumentFnAttr>,
 }
 
 #[derive(Copy, Clone, Debug, TyEncodable, TyDecodable, StableHash, PartialEq, Eq)]
@@ -203,9 +185,6 @@ bitflags::bitflags! {
         /// `#[naked]`: an indicator to LLVM that no function prologue/epilogue
         /// should be generated.
         const NAKED                     = 1 << 2;
-        /// `#[no_mangle]`: an indicator that the function's name should be the same
-        /// as its symbol.
-        const NO_MANGLE                 = 1 << 3;
         /// `#[rustc_std_internal_symbol]`: an indicator that this symbol is a
         /// "weird symbol" for the standard library in that it has slightly
         /// different linkage, visibility, and reachability rules.
@@ -274,7 +253,7 @@ impl CodegenFnAttrs {
             patchable_function_entry: None,
             objc_class: None,
             objc_selector: None,
-            instrument_fn: InstrumentFnAttr::default(),
+            instrument_fn: None,
         }
     }
 
@@ -284,14 +263,15 @@ impl CodegenFnAttrs {
     /// * `#[export_name(...)]` is present
     /// * `#[linkage]` is present
     ///
-    /// Keep this in sync with the logic for the unused_attributes for `#[inline]` lint.
+    /// Keep this in sync with [`AttributeKind::is_extern_indicator`].
+    ///
+    /// [`AttributeKind::is_extern_indicator`]: rustc_attr_ir::AttributeKind::is_extern_indicator
     pub fn contains_extern_indicator(&self) -> bool {
         if self.flags.contains(CodegenFnAttrFlags::FOREIGN_ITEM) {
             return false;
         }
 
-        self.flags.contains(CodegenFnAttrFlags::NO_MANGLE)
-            || self.flags.contains(CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL)
+        self.flags.contains(CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL)
             // note: for these we do also set a symbol name so technically also handled by the
             // condition below. However, I think that regardless these should be treated as extern.
             || self.flags.contains(CodegenFnAttrFlags::EXTERNALLY_IMPLEMENTABLE_ITEM)

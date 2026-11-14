@@ -33,7 +33,8 @@ impl RustdocGuiTestProps {
 
         let props = TestProps::from_file(test_file_path, None, &config);
 
-        let TestProps { compile_flags, run_flags, .. } = props;
+        // FIXME: Why do we need to ignore the edition?
+        let TestProps { edition: _, compile_flags, run_flags, .. } = props;
         Self { compile_flags, run_flags }
     }
 }
@@ -118,6 +119,7 @@ fn incomplete_config_for_rustdoc_gui_test() -> Config {
         rustfix_coverage: Default::default(),
         has_enzyme: Default::default(),
         has_offload: Default::default(),
+        has_tpde: Default::default(),
         channel: Default::default(),
         git_hash: Default::default(),
         cc: Default::default(),
@@ -143,7 +145,6 @@ fn incomplete_config_for_rustdoc_gui_test() -> Config {
         default_codegen_backend: CodegenBackend::Llvm,
         override_codegen_backend: None,
         bypass_ignore_backends: Default::default(),
-        gcc_supported_target_tuples: vec![],
         jobs: Default::default(),
         parallel_frontend_threads: Config::DEFAULT_PARALLEL_FRONTEND_THREADS,
         iteration_count: Config::DEFAULT_ITERATION_COUNT,
